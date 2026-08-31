@@ -10,7 +10,7 @@ ARCore is **not** part of the OS and **not** an SDK-only dependency. It is a
 separate service app — **"Google Play Services for AR"**
 (`com.google.ar.core`) — that apps bind to. The ARCore Android SDK
 (`com.google.ar:arcore`) is a thin client: an "AR Required" app must call
-`ArCoreApk.checkSupport(context)` at startup and, if the service is
+`ArCoreApk.getInstance().checkAvailability(context)` at startup and, if the service is
 missing/disabled, point the user at installing it.
 
 Consequences for Bildfang:
@@ -25,8 +25,8 @@ Consequences for Bildfang:
 
 | Device | GrapheneOS | ARCore-certified | Status / evidence |
 |---|---|---|---|
-| Pixel 7 (Tensor G2) | official build, supported | **Yes** — listed on [ARCore supported devices](https://developers.google.com/ar/devices) (snapshot 2026-08-25): OpenGL ES 3.2, GPU texture up to 1080p, no Depth API | ARCore can be installed via the sandboxed Play Store (see below). **Verify on-device** with `checkSupport()` in the Phase-1 smoke test |
-| Pixel 9 Pro (Tensor G4) | official build, supported (GrapheneOS [releases](https://grapheneos.org/releases) list the Pixel 9 Pro as a supported device) | **Unverified** — the public lists I checked do not show the Pixel 9 family (a [Play-Console-list mirror](https://github.com/rolandsmeenk/ARCore-devices) last updated 2024-02 stops at Pixel 8; a 2026-08-25 snapshot of Google's device page shows no Pixel 9 rows) | **Open question — decide on-device.** If `checkSupport()` fails, options: wait for a Play-services-for-AR update that certifies it, or accept Pixel 7 as the primary capture device |
+| Pixel 7 (Tensor G2) | official build, supported | **Yes** — listed on [ARCore supported devices](https://developers.google.com/ar/devices) (snapshot 2026-08-25): OpenGL ES 3.2, GPU texture up to 1080p, no Depth API | ARCore can be installed via the sandboxed Play Store (see below). **Verify on-device** with `checkAvailability()` in the Phase-1 smoke test |
+| Pixel 9 Pro (Tensor G4) | official build, supported (GrapheneOS [releases](https://grapheneos.org/releases) list the Pixel 9 Pro as a supported device) | **Unverified** — the public lists I checked do not show the Pixel 9 family (a [Play-Console-list mirror](https://github.com/rolandsmeenk/ARCore-devices) last updated 2024-02 stops at Pixel 8; a 2026-08-25 snapshot of Google's device page shows no Pixel 9 rows) | **Open question — decide on-device.** If `checkAvailability()` fails, options: wait for a Play-services-for-AR update that certifies it, or accept Pixel 7 as the primary capture device |
 
 The app must treat both identically at runtime (support check, never a
 compile-time assumption).
@@ -78,7 +78,7 @@ Nextcloud), never app-initiated.
 - [ ] ARCore network permission: **restricted/revoked**
 - [ ] Bildfang permissions granted: camera, sensors (IMU), storage (session
       directory)
-- [ ] In-app `checkSupport()` → "supported" (Phase 1 smoke test; on the
+- [ ] In-app `checkAvailability()` → "supported" (Phase 1 smoke test; on the
       Pixel 9 Pro this is the decision gate)
 - [ ] Battery: disable battery optimization for Bildfang during captures
 

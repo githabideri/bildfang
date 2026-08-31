@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Bildfang</string>
+    <string name="app_subtitle">Spatial Capture for Bildwerk</string>
+    <string name="start_capture">Start Capture</string>
+    <string name="stop_capture">Stop Capture</string>
+
+    <string name="support_ok">ARCore ready</string>
+    <string name="support_install">ARCore not installed. Install "Google Play Services for AR" (search "ARCore" in your Play Store), then reopen this app.</string>
+    <string name="support_unsupported">This device is not ARCore-supported.</string>
+
+    <string name="status_recording">Recording…</string>
+    <string name="status_stopped">Capture exported</string>
+</resources>

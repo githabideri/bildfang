@@ -75,12 +75,12 @@ bildfang/
 └── .github/workflows/build-apk.yml
 ```
 
-## Status (Phase 0 — documentation)
+## Status
 
 | Phase | Scope | Status |
 |-------|-------|--------|
-| 0 | Repository, capture format, coordinate system, GrapheneOS requirements | ✅ this commit |
-| 1 | Minimal app: start/stop, ARCore session, poses.json export | ⬜ |
+| 0 | Repository, capture format, coordinate system, GrapheneOS requirements | ✅ done |
+| 1 | Minimal app: start/stop, ARCore session, poses.json export | 🟡 built + unit-tested, awaiting first on-device capture |
 | 2 | Video recording + timestamp sync (poses ↔ video frames) | ⬜ |
 | 3 | IMU export, manifest generation, trajectory tooling | ⬜ |
 | 4 | Bildwerk integration (capture folder → Bildwerk manifest) | ⬜ |
