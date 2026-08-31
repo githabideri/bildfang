@@ -1,0 +1,587 @@
+{
+  "schema": "bildfang-capture/v1-poses",
+  "coordinate_system": "arcore-world-v1",
+  "clock": "monotonic_ns",
+  "units": {
+    "translation": "meters",
+    "rotation": "quaternion x,y,z,w"
+  },
+  "poses": [
+    {
+      "i": 0,
+      "timestamp_ns": 4321000000000,
+      "translation": {
+        "x": 0.0,
+        "y": 1.4,
+        "z": -2.0
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": -0.707107,
+        "z": 0.0,
+        "w": 0.707107
+      },
+      "tracking_state": "TRACKING"
+    },
+    {
+      "i": 1,
+      "timestamp_ns": 4321500000000,
+      "translation": {
+        "x": 0.3473,
+        "y": 1.4,
+        "z": -1.9696
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": -0.816266,
+        "z": 0.0,
+        "w": 0.577677
+      },
+      "tracking_state": "TRACKING"
+    },
+    {
+      "i": 2,
+      "timestamp_ns": 4322000000000,
+      "translation": {
+        "x": 0.684,
+        "y": 1.4,
+        "z": -1.8794
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": -0.891214,
+        "z": 0.0,
+        "w": 0.453583
+      },
+      "tracking_state": "TRACKING"
+    },
+    {
+      "i": 3,
+      "timestamp_ns": 4322500000000,
+      "translation": {
+        "x": 1.0,
+        "y": 1.4,
+        "z": -1.7321
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": -0.936998,
+        "z": 0.0,
+        "w": 0.349336
+      },
+      "tracking_state": "TRACKING"
+    },
+    {
+      "i": 4,
+      "timestamp_ns": 4323000000000,
+      "translation": {
+        "x": 1.2856,
+        "y": 1.4,
+        "z": -1.5321
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": -0.964119,
+        "z": 0.0,
+        "w": 0.26547
+      },
+      "tracking_state": "TRACKING"
+    },
+    {
+      "i": 5,
+      "timestamp_ns": 4323500000000,
+      "translation": {
+        "x": 1.5321,
+        "y": 1.4,
+        "z": -1.2856
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": -0.980339,
+        "z": 0.0,
+        "w": 0.197319
+      },
+      "tracking_state": "TRACKING"
+    },
+    {
+      "i": 6,
+      "timestamp_ns": 4324000000000,
+      "translation": {
+        "x": 1.7321,
+        "y": 1.4,
+        "z": -1.0
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": -0.990144,
+        "z": 0.0,
+        "w": 0.140055
+      },
+      "tracking_state": "TRACKING"
+    },
+    {
+      "i": 7,
+      "timestamp_ns": 4324500000000,
+      "translation": {
+        "x": 1.8794,
+        "y": 1.4,
+        "z": -0.684
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": -0.995952,
+        "z": 0.0,
+        "w": 0.089886
+      },
+      "tracking_state": "TRACKING"
+    },
+    {
+      "i": 8,
+      "timestamp_ns": 4325000000000,
+      "translation": {
+        "x": 1.9696,
+        "y": 1.4,
+        "z": -0.3473
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": -0.999034,
+        "z": 0.0,
+        "w": 0.043954
+      },
+      "tracking_state": "TRACKING"
+    },
+    {
+      "i": 9,
+      "timestamp_ns": 4325500000000,
+      "translation": {
+        "x": 2.0,
+        "y": 1.4,
+        "z": -0.0
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": -1.0,
+        "z": 0.0,
+        "w": 0.0
+      },
+      "tracking_state": "TRACKING"
+    },
+    {
+      "i": 10,
+      "timestamp_ns": 4326000000000,
+      "translation": {
+        "x": 1.9696,
+        "y": 1.4,
+        "z": 0.3473
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": 0.999034,
+        "z": 0.0,
+        "w": 0.043954
+      },
+      "tracking_state": "PAUSED"
+    },
+    {
+      "i": 11,
+      "timestamp_ns": 4326500000000,
+      "translation": {
+        "x": 1.8794,
+        "y": 1.4,
+        "z": 0.684
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": 0.995952,
+        "z": 0.0,
+        "w": 0.089886
+      },
+      "tracking_state": "PAUSED"
+    },
+    {
+      "i": 12,
+      "timestamp_ns": 4327000000000,
+      "translation": {
+        "x": 1.7321,
+        "y": 1.4,
+        "z": 1.0
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": 0.990144,
+        "z": 0.0,
+        "w": 0.140055
+      },
+      "tracking_state": "PAUSED"
+    },
+    {
+      "i": 13,
+      "timestamp_ns": 4327500000000,
+      "translation": {
+        "x": 1.5321,
+        "y": 1.4,
+        "z": 1.2856
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": 0.980339,
+        "z": 0.0,
+        "w": 0.197319
+      },
+      "tracking_state": "TRACKING"
+    },
+    {
+      "i": 14,
+      "timestamp_ns": 4328000000000,
+      "translation": {
+        "x": 1.2856,
+        "y": 1.4,
+        "z": 1.5321
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": 0.964119,
+        "z": 0.0,
+        "w": 0.26547
+      },
+      "tracking_state": "TRACKING"
+    },
+    {
+      "i": 15,
+      "timestamp_ns": 4328500000000,
+      "translation": {
+        "x": 1.0,
+        "y": 1.4,
+        "z": 1.7321
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": 0.936998,
+        "z": 0.0,
+        "w": 0.349336
+      },
+      "tracking_state": "TRACKING"
+    },
+    {
+      "i": 16,
+      "timestamp_ns": 4329000000000,
+      "translation": {
+        "x": 0.684,
+        "y": 1.4,
+        "z": 1.8794
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": 0.891214,
+        "z": 0.0,
+        "w": 0.453583
+      },
+      "tracking_state": "TRACKING"
+    },
+    {
+      "i": 17,
+      "timestamp_ns": 4329500000000,
+      "translation": {
+        "x": 0.3473,
+        "y": 1.4,
+        "z": 1.9696
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": 0.816266,
+        "z": 0.0,
+        "w": 0.577677
+      },
+      "tracking_state": "TRACKING"
+    },
+    {
+      "i": 18,
+      "timestamp_ns": 4330000000000,
+      "translation": {
+        "x": 0.0,
+        "y": 1.4,
+        "z": 2.0
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": 0.707107,
+        "z": 0.0,
+        "w": 0.707107
+      },
+      "tracking_state": "TRACKING"
+    },
+    {
+      "i": 19,
+      "timestamp_ns": 4330500000000,
+      "translation": {
+        "x": -0.3473,
+        "y": 1.4,
+        "z": 1.9696
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": 0.577677,
+        "z": 0.0,
+        "w": 0.816266
+      },
+      "tracking_state": "TRACKING"
+    },
+    {
+      "i": 20,
+      "timestamp_ns": 4331000000000,
+      "translation": {
+        "x": -0.684,
+        "y": 1.4,
+        "z": 1.8794
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": 0.453583,
+        "z": 0.0,
+        "w": 0.891214
+      },
+      "tracking_state": "TRACKING"
+    },
+    {
+      "i": 21,
+      "timestamp_ns": 4331500000000,
+      "translation": {
+        "x": -1.0,
+        "y": 1.4,
+        "z": 1.7321
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": 0.349336,
+        "z": 0.0,
+        "w": 0.936998
+      },
+      "tracking_state": "TRACKING"
+    },
+    {
+      "i": 22,
+      "timestamp_ns": 4332000000000,
+      "translation": {
+        "x": -1.2856,
+        "y": 1.4,
+        "z": 1.5321
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": 0.26547,
+        "z": 0.0,
+        "w": 0.964119
+      },
+      "tracking_state": "TRACKING"
+    },
+    {
+      "i": 23,
+      "timestamp_ns": 4332500000000,
+      "translation": {
+        "x": -1.5321,
+        "y": 1.4,
+        "z": 1.2856
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": 0.197319,
+        "z": 0.0,
+        "w": 0.980339
+      },
+      "tracking_state": "TRACKING"
+    },
+    {
+      "i": 24,
+      "timestamp_ns": 4333000000000,
+      "translation": {
+        "x": -1.7321,
+        "y": 1.4,
+        "z": 1.0
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": 0.140055,
+        "z": 0.0,
+        "w": 0.990144
+      },
+      "tracking_state": "TRACKING"
+    },
+    {
+      "i": 25,
+      "timestamp_ns": 4333500000000,
+      "translation": {
+        "x": -1.8794,
+        "y": 1.4,
+        "z": 0.684
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": 0.089886,
+        "z": 0.0,
+        "w": 0.995952
+      },
+      "tracking_state": "TRACKING"
+    },
+    {
+      "i": 26,
+      "timestamp_ns": 4334000000000,
+      "translation": {
+        "x": -1.9696,
+        "y": 1.4,
+        "z": 0.3473
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": 0.043954,
+        "z": 0.0,
+        "w": 0.999034
+      },
+      "tracking_state": "TRACKING"
+    },
+    {
+      "i": 27,
+      "timestamp_ns": 4334500000000,
+      "translation": {
+        "x": -2.0,
+        "y": 1.4,
+        "z": 0.0
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0,
+        "w": 1.0
+      },
+      "tracking_state": "TRACKING"
+    },
+    {
+      "i": 28,
+      "timestamp_ns": 4335000000000,
+      "translation": {
+        "x": -1.9696,
+        "y": 1.4,
+        "z": -0.3473
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": -0.043954,
+        "z": 0.0,
+        "w": 0.999034
+      },
+      "tracking_state": "TRACKING"
+    },
+    {
+      "i": 29,
+      "timestamp_ns": 4335500000000,
+      "translation": {
+        "x": -1.8794,
+        "y": 1.4,
+        "z": -0.684
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": -0.089886,
+        "z": 0.0,
+        "w": 0.995952
+      },
+      "tracking_state": "TRACKING"
+    },
+    {
+      "i": 30,
+      "timestamp_ns": 4336000000000,
+      "translation": {
+        "x": -1.7321,
+        "y": 1.4,
+        "z": -1.0
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": -0.140055,
+        "z": 0.0,
+        "w": 0.990144
+      },
+      "tracking_state": "TRACKING"
+    },
+    {
+      "i": 31,
+      "timestamp_ns": 4336500000000,
+      "translation": {
+        "x": -1.5321,
+        "y": 1.4,
+        "z": -1.2856
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": -0.197319,
+        "z": 0.0,
+        "w": 0.980339
+      },
+      "tracking_state": "TRACKING"
+    },
+    {
+      "i": 32,
+      "timestamp_ns": 4337000000000,
+      "translation": {
+        "x": -1.2856,
+        "y": 1.4,
+        "z": -1.5321
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": -0.26547,
+        "z": 0.0,
+        "w": 0.964119
+      },
+      "tracking_state": "TRACKING"
+    },
+    {
+      "i": 33,
+      "timestamp_ns": 4337500000000,
+      "translation": {
+        "x": -1.0,
+        "y": 1.4,
+        "z": -1.7321
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": -0.349336,
+        "z": 0.0,
+        "w": 0.936998
+      },
+      "tracking_state": "TRACKING"
+    },
+    {
+      "i": 34,
+      "timestamp_ns": 4338000000000,
+      "translation": {
+        "x": -0.684,
+        "y": 1.4,
+        "z": -1.8794
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": -0.453583,
+        "z": 0.0,
+        "w": 0.891214
+      },
+      "tracking_state": "TRACKING"
+    },
+    {
+      "i": 35,
+      "timestamp_ns": 4338500000000,
+      "translation": {
+        "x": -0.3473,
+        "y": 1.4,
+        "z": -1.9696
+      },
+      "rotation_quaternion": {
+        "x": 0.0,
+        "y": -0.577677,
+        "z": 0.0,
+        "w": 0.816266
+      },
+      "tracking_state": "TRACKING"
+    }
+  ]
+}

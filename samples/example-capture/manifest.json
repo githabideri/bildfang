@@ -1,0 +1,70 @@
+{
+  "schema": "bildfang-capture/v1",
+  "capture_id": "capture-20260831T120000-ab12cd",
+  "note": "SYNTHETIC sample capture \u2014 generated programmatically to exercise tools/ and document the format; not real sensor data",
+  "app": {
+    "name": "Bildfang",
+    "version": "0.1.0",
+    "commit": "0000000"
+  },
+  "device": {
+    "manufacturer": "Google",
+    "model": "Pixel 9 Pro (synthetic sample)",
+    "android_version": "15",
+    "sdk_int": 35
+  },
+  "arcore": {
+    "play_services_version": "0.0.0",
+    "tracking_features": [
+      "motion",
+      "imu_fusion"
+    ],
+    "environment": "UNKNOWN"
+  },
+  "started_at": "2026-08-31T12:00:00.000Z",
+  "ended_at": "2026-08-31T12:00:17.500Z",
+  "duration_ns": 17500000000,
+  "monotonic": {
+    "clock": "SystemClock.elapsedRealtimeNanos",
+    "boot_time_at_start_ms": 4321000,
+    "session_start_ns": 4321000000000
+  },
+  "files": [
+    {
+      "path": "video/README.md",
+      "type": "video_note",
+      "size_bytes": 249,
+      "sha256": "47dca357e97d5bc6522b95209aa0c9b1c73672a924f9903b29d78bca78a40765"
+    },
+    {
+      "path": "poses/poses.json",
+      "type": "pose",
+      "size_bytes": 11403,
+      "sha256": "dcc1d7ec5da9de3c36e34955f560a31c35801c5786ec6c8704a2abf8cf58a9c5"
+    },
+    {
+      "path": "imu/imu.csv",
+      "type": "imu",
+      "size_bytes": 751,
+      "sha256": "5cac324d4d199c9559b4d2c80cf530b141bd29929d5283990cc87507bd0d8aa0"
+    },
+    {
+      "path": "camera/intrinsics.json",
+      "type": "intrinsics",
+      "size_bytes": 561,
+      "sha256": "f3a291bb17bce4dbf8ab935eb7edda8e8f5a8e283e78d98fdf1be02b9762ea19"
+    },
+    {
+      "path": "metadata/device.json",
+      "type": "device",
+      "size_bytes": 747,
+      "sha256": "cdf8cd281c0d228fd427697087765c9a891d2d7c0132dfc65211b7cad69922f2"
+    },
+    {
+      "path": "video/camera.mp4",
+      "type": "video",
+      "note": "not committed in the sample; in real captures this entry carries size_bytes + sha256"
+    }
+  ],
+  "created_at": "2026-08-31T12:00:18.000Z"
+}

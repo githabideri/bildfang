@@ -1,0 +1,29 @@
+{
+  "schema": "bildfang-capture/v1-intrinsics",
+  "model": "pinhole",
+  "arcore_image": {
+    "width": 640,
+    "height": 480,
+    "fx": 321.4,
+    "fy": 321.7,
+    "cx": 320.0,
+    "cy": 240.0
+  },
+  "distortion": [
+    0.01,
+    -0.02,
+    0.0001,
+    -0.0001,
+    0.0
+  ],
+  "video": {
+    "width": 1920,
+    "height": 1080,
+    "fx": 964.2,
+    "fy": 965.1,
+    "cx": 960.0,
+    "cy": 540.0,
+    "note": "ARCore intrinsics scaled from the ARCore image size to the video resolution; valid while the same physical camera is used"
+  },
+  "camera_id": "back"
+}

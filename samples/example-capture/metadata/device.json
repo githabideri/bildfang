@@ -1,0 +1,39 @@
+{
+  "schema": "bildfang-capture/v1-device",
+  "manufacturer": "Google",
+  "model": "Pixel 9 Pro (synthetic sample)",
+  "android_version": "15",
+  "sdk_int": 35,
+  "os": "GrapheneOS 20260701",
+  "screen": {
+    "width_px": 1280,
+    "height_px": 2856,
+    "density_dpi": 423
+  },
+  "sensors": {
+    "accelerometer": "lsm6dso",
+    "gyroscope": "lsm6dso",
+    "imu_rate_hz": 50
+  },
+  "camera": {
+    "back": {
+      "physical_id": "synthetic",
+      "sensors": [
+        "color",
+        "imaging"
+      ],
+      "available_resolutions": [
+        [
+          3840,
+          2160
+        ],
+        [
+          1920,
+          1080
+        ]
+      ]
+    }
+  },
+  "wall_clock_at_start": "2026-08-31T12:00:00Z",
+  "boot_time_at_start_ms": 4321000
+}

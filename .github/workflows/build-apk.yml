@@ -1,0 +1,84 @@
+name: build-apk
+
+# Debug APK on every push to main; signed release APK (Bildfang-vX.Y.Z.apk)
+# on version tags. No Play Store — APKs are installable manually.
+#
+# NOTE: Phase 0 has no Gradle project yet; the jobs detect this and skip.
+# The release job needs two repository secrets (base64):
+#   BILDFANG_KEYSTORE_B64        keystore.jks
+#   BILDFANG_KEYSTORE_PROPS_B64  key.properties (store/key alias + passwords)
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      has_gradle: ${{ steps.c.outputs.has_gradle }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: c
+        run: |
+          if [ -f app/build.gradle.kts ] || [ -f app/build.gradle ]; then
+            echo "has_gradle=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_gradle=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No Gradle project in app/ yet (pre-Phase 1) — skipping builds"
+          fi
+
+  debug:
+    needs: detect
+    if: needs.detect.outputs.has_gradle == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Build debug APK
+        run: ./gradlew :app:assembleDebug
+        working-directory: .
+        env:
+          ANDROID_HOME: ${{ runner.os == 'Linux' && '/opt/android' || '' }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Bildfang-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+  release:
+    needs: detect
+    if: needs.detect.outputs.has_gradle == 'true' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Restore signing key
+        run: |
+          echo "$BILDFANG_KEYSTORE_B64" | base64 -d > keystore.jks
+          echo "$BILDFANG_KEYSTORE_PROPS_B64" | base64 -d > key.properties
+        env:
+          BILDFANG_KEYSTORE_B64: ${{ secrets.BILDFANG_KEYSTORE_B64 }}
+          BILDFANG_KEYSTORE_PROPS_B64: ${{ secrets.BILDFANG_KEYSTORE_PROPS_B64 }}
+      - name: Build signed release APK
+        run: |
+          ./gradlew :app:assembleRelease \
+            -PstoreFile=keystore.jks -PstoreProps=key.properties
+      - name: Package with version name
+        run: |
+          v="${GITHUB_REF#refs/tags/}"
+          mv app/build/outputs/apk/release/app-release.apk "Bildfang-${v}.apk"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Bildfang-${{ github.ref_name }}
+          path: Bildfang-*.apk

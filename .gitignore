@@ -1,0 +1,20 @@
+# Gradle
+.gradle/
+build/
+app/build/
+local.properties
+
+# IDE
+.idea/
+*.iml
+captures/
+.cxx/
+
+# Signing (never commit real keys)
+keystore.jks
+*.jks
+key.properties
+
+# Build artifacts
+*.apk
+*.aab
