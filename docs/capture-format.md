@@ -30,21 +30,26 @@ where reasonable. CSV: LF line endings, CRLF-free.
 
 ---
 
-## The single clock (critical)
+## The clocks (critical)
 
-All timestamps in `poses.json`, `imu.csv`, `frames.json`, and the video
-container's presentation timestamps are on the **same monotonic clock**:
-`SystemClock.elapsedRealtimeNanos()` on Android (nanoseconds since boot,
-does not change with wall-clock adjustments, stops when the device sleeps —
-a capture that crosses a sleep is split; see "interruptions").
+**Verified on-device (ARCore 1.54, Pixel 7, 2026-09-01):** `Frame.getTimestamp()` is **not** on `SystemClock.elapsedRealtimeNanos()` — it is a large fixed-epoch value (≈1.78×10¹⁸ ns, likely unix nanoseconds) on its own internal clock. bildfang therefore does **not** assume any shared epoch.
 
-- Wall-clock time appears **only** in `manifest.json` (`started_at`,
-  `ended_at`, `created_at`, ISO 8601 UTC) and in `metadata/device.json`
-  (`boot_time` / `wall_clock_at_start` as reference points).
-- Synchronization between video and poses requires **no NTP-style
-  correlation**: both are expressed on the device's monotonic ns clock.
-  This is the whole point of the design — it makes the capture
-  reproducible and verifiable offline.
+All bildfang frame clocks are **session-relative**: `frame.timestamp - anchor`, where the anchor is the timestamp of the first frame delivered to the app. `session.json` stores the anchor triple for absolute reconstruction:
+
+```json
+"clock": {
+  "frame_timestamp_ns": "ARCore frame clock, epoch unknown (fixed, likely unix ns)",
+  "anchor_frame_ts": 1780000000000000000,
+  "anchor_unix_ms":  1788212345678,
+  "anchor_monotonic_ns": 4321000000000
+}
+```
+
+- `anchor_unix_ms` / `anchor_monotonic_ns` are read from `System.currentTimeMillis()` / `SystemClock.elapsedRealtimeNanos()` at the instant of the first frame, so any absolute epoch can be derived offline.
+- Every pose additionally carries `android_camera_timestamp_ns` (`Frame.getAndroidCameraTimestamp()`) — the **HAL camera clock**, which is the clock the video encoder uses for presentation timestamps. This is the field that aligns poses to video PTS; the ARCore frame timestamp aligns poses to each other.
+- Wall-clock time appears in `session.json` (`created_utc`, ISO 8601 UTC) only as a reference.
+
+> The Phase-0 ideal (one shared `elapsedRealtimeNanos` clock across all files, `manifest.json` with sha256 hashes, separate `imu.csv` / `frames.json` / `intrinsics.json`) remains the target for later versions. The current app (v0.2.0) writes `session.json` + `poses/poses.json` + `video.mp4` (ARCore-native MP4, which already embeds the IMU and a custom JSON pose track in the container itself).
 
 ## `manifest.json`
 
@@ -106,12 +111,13 @@ chosen for tooling ergonomics at this size).
 {
   "schema": "bildfang-capture/v1-poses",
   "coordinate_system": "arcore-world-v1",
-  "clock": "monotonic_ns",
+  "clock": "session-relative_ns (anchor in session.json)",
   "units": { "translation": "meters", "rotation": "quaternion x,y,z,w" },
   "poses": [
     {
       "i": 0,
-      "timestamp_ns": 4321001234567,
+      "timestamp_ns": 12345678901234,
+      "android_camera_timestamp_ns": 9876543210,
       "translation": { "x": 0.0, "y": 0.0, "z": 0.0 },
       "rotation_quaternion": { "x": 0.01, "y": 0.22, "z": 0.03, "w": 0.97 },
       "tracking_state": "TRACKING"
@@ -120,9 +126,8 @@ chosen for tooling ergonomics at this size).
 }
 ```
 
-- `timestamp_ns` — ARCore frame timestamp (`Frame.getTimestamp()`), i.e. the
-  monotonic ns clock above (the time of the sensor fusion that produced the
-  pose, not the video encoder's clock).
+- `timestamp_ns` — ARCore frame timestamp, **relative to the session
+  anchor** (see "The clocks"; not the raw ARCore epoch).
 - `translation` — camera optical center position in the **ARCore world
   frame**, meters. See [coordinate-system.md](coordinate-system.md).
 - `rotation_quaternion` — rotation **from camera local frame to world

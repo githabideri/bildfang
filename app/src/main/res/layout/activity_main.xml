@@ -1,71 +1,68 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<LinearLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical"
-    android:gravity="center"
-    android:background="@android:color/black"
-    android:padding="32dp">
+    android:background="#FF000000"
+    android:padding="12dp">
+
+    <!-- The live preview: the ARCore camera texture (GL_TEXTURE_EXTERNAL_OES)
+         rendered straight into this surface — zero CPU cost. The same GL
+         thread drives Session.update() (ARCore 1.54 requires a GL context). -->
+    <android.opengl.GLSurfaceView
+        android:id="@+id/gl"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:background="#FF101418" />
 
     <TextView
-        android:layout_width="wrap_content"
+        android:id="@+id/timerView"
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="@string/app_name"
-        android:textColor="@android:color/white"
-        android:textSize="34sp"
-        android:textStyle="bold" />
+        android:textSize="28sp"
+        android:textColor="#FF00E5FF"
+        android:text="@string/time_zero" />
 
     <TextView
-        android:layout_width="wrap_content"
+        android:id="@+id/metricsView"
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="@string/app_subtitle"
-        android:textColor="#888888"
         android:textSize="14sp"
-        android:layout_marginBottom="32dp" />
+        android:textColor="#FFB0BEC5"
+        android:fontFamily="monospace"
+        android:text="@string/status_idle" />
 
     <TextView
-        android:id="@+id/status"
+        android:id="@+id/statusView"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:textColor="#44AA44"
         android:textSize="16sp"
-        android:gravity="center"
-        android:layout_marginBottom="16dp" />
+        android:textColor="#FFFFFFFF"
+        android:text="@string/status_checking" />
 
-    <TextView
-        android:id="@+id/stats"
+    <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:textColor="@android:color/white"
-        android:textSize="16sp"
-        android:typeface="monospace"
-        android:gravity="center"
-        android:layout_marginBottom="32dp" />
+        android:orientation="horizontal"
+        android:layout_marginTop="12dp">
 
-    <Button
-        android:id="@+id/start"
-        android:layout_width="220dp"
-        android:layout_height="wrap_content"
-        android:text="@string/start_capture"
-        android:textSize="18sp" />
+        <Button
+            android:id="@+id/startBtn"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginEnd="8dp"
+            android:text="@string/start" />
 
-    <Button
-        android:id="@+id/stop"
-        android:layout_width="220dp"
-        android:layout_height="wrap_content"
-        android:text="@string/stop_capture"
-        android:textSize="18sp"
-        android:enabled="false" />
-
-    <TextView
-        android:id="@+id/path"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:textColor="#666666"
-        android:textSize="11sp"
-        android:typeface="monospace"
-        android:gravity="center"
-        android:layout_marginTop="24dp"
-        android:visibility="gone" />
-
+        <Button
+            android:id="@+id/stopBtn"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginStart="8dp"
+            android:enabled="false"
+            android:text="@string/stop" />
+    </LinearLayout>
 </LinearLayout>

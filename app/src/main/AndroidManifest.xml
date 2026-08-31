@@ -13,6 +13,12 @@
         android:allowBackup="false"
         android:theme="@android:style/Theme.Material.NoActionBar">
 
+        <!-- Required by the ARCore AAR: declares that "Google Play Services
+             for AR" (com.google.ar.core) is mandatory for this app. Without
+             it, checkAvailability() dies with FatalException before it can
+             even answer (verified on-device 2026-08-31). -->
+        <meta-data android:name="com.google.ar.core" android:value="required" />
+
         <activity
             android:name=".MainActivity"
             android:screenOrientation="portrait"

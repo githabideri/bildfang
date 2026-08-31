@@ -12,6 +12,7 @@ package app.bildfang
 data class PoseRecord(
     val index: Int,
     val timestampNs: Long,
+    val androidCameraTimestampNs: Long = 0L, // HAL clock; aligns with video PTS
     val x: Float,
     val y: Float,
     val z: Float,
@@ -44,7 +45,7 @@ object PoseJson {
         sb.append("{\n")
         sb.append("  \"schema\": \"").append(SCHEMA).append("\",\n")
         sb.append("  \"coordinate_system\": \"").append(COORDINATE_SYSTEM).append("\",\n")
-        sb.append("  \"clock\": \"monotonic_ns\",\n")
+        sb.append("  \"clock\": \"session-relative_ns (anchor in session.json)\",\n")
         sb.append("  \"units\": { \"translation\": \"meters\", \"rotation\": \"quaternion x,y,z,w\" },\n")
         sb.append("  \"poses\": [\n")
         records.forEachIndexed { i, r ->
@@ -52,6 +53,9 @@ object PoseJson {
             sb.append("    {\n")
             sb.append("      \"i\": ").append(r.index).append(",\n")
             sb.append("      \"timestamp_ns\": ").append(r.timestampNs).append(",\n")
+            if (r.androidCameraTimestampNs != 0L) {
+                sb.append("      \"android_camera_timestamp_ns\": ").append(r.androidCameraTimestampNs).append(",\n")
+            }
             if (r.segment > 0) sb.append("      \"segment\": ").append(r.segment).append(",\n")
             sb.append("      \"translation\": { \"x\": ").append(f(r.x - anchor.x)).append(", ")
               .append("\"y\": ").append(f(r.y - anchor.y)).append(", ")

@@ -10,7 +10,27 @@ class PoseJsonTest {
         i: Int, ts: Long,
         x: Float, y: Float, z: Float,
         state: String = "TRACKING", segment: Int = 0,
-    ) = PoseRecord(i, ts, x, y, z, 0f, 0f, 0f, 1f, state, segment)
+    ) = PoseRecord(
+        index = i, timestampNs = ts, x = x, y = y, z = z,
+        qx = 0f, qy = 0f, qz = 0f, qw = 1f,
+        trackingState = state, segment = segment,
+    )
+
+    @Test
+    fun `android camera timestamp is emitted when present and omitted when zero`() {
+        val withCam = PoseRecord(
+            index = 0, timestampNs = 1000, androidCameraTimestampNs = 987654321L,
+            x = 0f, y = 0f, z = 0f, qx = 0f, qy = 0f, qz = 0f, qw = 1f,
+            trackingState = "TRACKING", segment = 0,
+        )
+        val withoutCam = PoseRecord(
+            index = 0, timestampNs = 1000, androidCameraTimestampNs = 0L,
+            x = 0f, y = 0f, z = 0f, qx = 0f, qy = 0f, qz = 0f, qw = 1f,
+            trackingState = "TRACKING", segment = 0,
+        )
+        assertTrue(PoseJson.build(listOf(withCam)).contains("\"android_camera_timestamp_ns\": 987654321"))
+        assertTrue(!PoseJson.build(listOf(withoutCam)).contains("android_camera_timestamp_ns"))
+    }
 
     @Test
     fun `first pose of a segment is normalized to origin`() {
