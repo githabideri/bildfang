@@ -36,8 +36,21 @@ interface VideoRecorder {
 
 /**
  * Frame accounting. Every observed camera frame must end up in exactly
- * one of: submitted (and then encoded, possibly dropped later by the
- * encoder/muxer) — the counters make any loss observable.
+ * one of:
+ *
+ *   rateSkipped -- intentionally not encoded because the source/update
+ *                  runs faster than the encoder cadence (a deliberate
+ *                  sampling decision, not data loss in the preservation
+ *                  sense)
+ *   dropped     -- should have been submitted but the submit failed
+ *                  (no free input buffer, EGL swap failure)
+ *   submitted   -- handed to the encoder (then encoded, possibly lost
+ *                  by the encoder/muxer -- that gap is observable via
+ *                  submitted vs encoded)
+ *
+ * Invariant: observed == rateSkipped + dropped + submitted.
+ * Silent loss is forbidden: every path that consumes a camera frame
+ * without encoding it must increment one of the first two counters.
  */
 data class RecorderCounters(
     var cameraFramesObserved: Long = 0,
@@ -45,6 +58,7 @@ data class RecorderCounters(
     var framesEncoded: Long = 0,
     var framesMuxed: Long = 0,
     var framesDropped: Long = 0,
+    var framesRateSkipped: Long = 0, // append at end: positional callers stay valid
 )
 
 /**
@@ -93,6 +107,7 @@ object FramesJson {
         sb.append("    \"frames_encoded\": ").append(counters.framesEncoded).append(",\n")
         sb.append("    \"frames_muxed\": ").append(counters.framesMuxed).append(",\n")
         sb.append("    \"frames_dropped\": ").append(counters.framesDropped).append("\n")
+        sb.append("    , \"frames_rate_skipped\": ").append(counters.framesRateSkipped).append("\n")
         sb.append("  },\n")
         sb.append("  \"frames\": [")
         frames.forEachIndexed { i, fr ->

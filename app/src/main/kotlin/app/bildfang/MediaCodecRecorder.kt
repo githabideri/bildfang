@@ -252,6 +252,12 @@ class MediaCodecRecorder(
         counters.framesDropped++
     }
 
+    /** Intentional cadence skip (source faster than encoder): not a failure. */
+    fun skipFrameForRate() {
+        counters.cameraFramesObserved++
+        counters.framesRateSkipped++
+    }
+
     /** Attach the pose recorded for the same camera frame (1:1 in practice;
      *  null is preserved when a frame genuinely has no pose). */
     fun attachPoseIndex(frameIdx: Int, poseIndex: Int) {
@@ -383,7 +389,8 @@ class MediaCodecRecorder(
         return if (s != null) "recorder start failed: $s"
         else "recorder ${if (running.get()) "recording" else "stopped"}: observed=${counters.cameraFramesObserved} " +
             "submitted=${counters.framesSubmitted} encoded=${counters.framesEncoded} " +
-            "muxed=${counters.framesMuxed} dropped=${counters.framesDropped}" +
+            "muxed=${counters.framesMuxed} dropped=${counters.framesDropped} " +
+            "rate_skipped=${counters.framesRateSkipped}" +
             if (finalFile.exists()) " → camera.mp4 (${finalFile.length()} bytes)" else ""
     }
 

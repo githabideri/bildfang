@@ -50,6 +50,7 @@ class FramesJsonTest {
                 framesEncoded = 298,
                 framesMuxed = 298,
                 framesDropped = 2,
+                framesRateSkipped = 5,
             )
         )
         assertTrue(json.contains("\"camera_frames_observed\": 300"))
@@ -57,6 +58,7 @@ class FramesJsonTest {
         assertTrue(json.contains("\"frames_encoded\": 298"))
         assertTrue(json.contains("\"frames_muxed\": 298"))
         assertTrue(json.contains("\"frames_dropped\": 2"))
+        assertTrue(json.contains("\"frames_rate_skipped\": 5"))
         assertTrue(json.contains("\"frames\": []"))
     }
 

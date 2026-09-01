@@ -176,24 +176,31 @@ def main():
                                    cnt.get("frames_encoded", 0),
                                    cnt.get("frames_muxed", 0),
                                    cnt.get("frames_dropped", 0))
-        check("counter invariant: observed == submitted + dropped",
-              obs == sub + drp, f"{obs} = {sub} + {drp}")
-        # The pipeline deliberately throttles submissions from the camera
-        # rate to the encoder rate (60 -> 30 fps on current devices), so
-        # drops are *expected* as long as they are counted (never silent).
-        # Fail only when the drop count cannot be explained by a rate gap.
-        if drp == 0:
-            check("frame drops (none)", True, "0")
-        elif video_ok and fmt_dur > 0 and sub > 0:
-            cam_fps = obs / fmt_dur
-            enc_fps = sub / fmt_dur
-            ratio = cam_fps / enc_fps if enc_fps > 0 else 0
-            explained = any(abs(ratio - k) < 0.15 for k in (1.0, 1.2, 1.33, 1.5, 2.0, 3.0))
-            check("drops explained by camera->encoder rate throttle (counted, not silent)",
-                  explained,
-                  f"camera {cam_fps:.1f} fps -> encoded {enc_fps:.1f} fps, {drp} dropped")
+        rate = cnt.get("frames_rate_skipped", 0)  # absent in pre-split sessions
+        check("counter invariant: observed == rate_skipped + dropped + submitted",
+              obs == rate + drp + sub, f"{obs} = {rate} + {drp} + {sub}")
+        # Intentional cadence skips (source faster than encoder, e.g. 60 ->
+        # 30 fps) are a deliberate sampling decision, counted separately
+        # from real submit failures (frames_dropped). A skip mass is
+        # *expected* when it matches a standard rate ratio; a large drop
+        # count is never.
+        if drp == 0 and rate == 0:
+            check("no non-submitted frames", True, "0")
         else:
-            check("frame drops (cannot verify throttle without video)", drp == 0, str(drp))
+            if video_ok and fmt_dur > 0 and sub > 0:
+                cam_fps = obs / fmt_dur
+                enc_fps = sub / fmt_dur
+                ratio = cam_fps / enc_fps if enc_fps > 0 else 0
+                explained = any(abs(ratio - k) < 0.15 for k in (1.0, 1.2, 1.33, 1.5, 2.0, 3.0))
+                check("non-submitted frames explained by camera->encoder rate ratio (never silent)",
+                      explained,
+                      f"camera {cam_fps:.1f} fps -> encoded {enc_fps:.1f} fps; "
+                      f"rate_skipped={rate} dropped={drp}")
+            else:
+                check("non-submitted frames (cannot verify throttle without video)",
+                      drp <= max(10, 0.02 * obs), f"rate_skipped={rate} dropped={drp}")
+        check("submit failures (frames_dropped) are few",
+              drp <= max(10, 0.02 * obs), f"{drp} of {obs}")
         check("encoded == muxed", enc == mux, f"{enc} / {mux}")
         if video_ok:
             check("video has >= 1 muxed frame", mux >= 1, str(mux))

@@ -413,13 +413,14 @@ class MainActivity : Activity() {
         // The encoder input buffer queue holds only a few buffers and the
         // encoder consumes at its own frame rate: submitting at the camera
         // rate (60 fps) overflows it within ~3 s and every later swap fails
-        // with EGL_BAD_SURFACE. Throttle submissions to the encoder rate
-        // (skipped frames are counted as drops, never silent).
+        // with EGL_BAD_SURFACE. Throttle submissions to the encoder rate;
+        // skipped frames are counted separately (frames_rate_skipped),
+        // never silent.
         val camTs = f.androidCameraTimestamp
         if (lastEncodeCamNs != 0L) {
             val intervalNs = 1_000_000_000L / rec.fps
             if (camTs - lastEncodeCamNs < intervalNs - 2_000_000L) {
-                rec.dropFrame()
+                rec.skipFrameForRate()
                 return
             }
         }
@@ -867,7 +868,8 @@ class MainActivity : Activity() {
                   "frames_submitted": ${recorder?.counters?.framesSubmitted ?: 0L},
                   "frames_encoded": ${recorder?.counters?.framesEncoded ?: 0L},
                   "frames_muxed": ${recorder?.counters?.framesMuxed ?: 0L},
-                  "frames_dropped": ${recorder?.counters?.framesDropped ?: 0L}
+                  "frames_dropped": ${recorder?.counters?.framesDropped ?: 0L},
+                  "frames_rate_skipped": ${recorder?.counters?.framesRateSkipped ?: 0L}
                 }
               },
               "frames_file": "video/frames.json",
