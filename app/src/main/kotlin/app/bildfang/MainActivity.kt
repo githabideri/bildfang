@@ -4,9 +4,9 @@ import android.Manifest
 import android.app.Activity
 import android.view.Display
 import android.content.pm.PackageManager
-import android.net.Uri
 import android.os.Bundle
 import android.os.SystemClock
+import android.opengl.EGL14
 import android.opengl.GLSurfaceView
 import android.util.Size
 import android.widget.Button
@@ -15,9 +15,7 @@ import com.google.ar.core.ArCoreApk
 import com.google.ar.core.Camera
 import com.google.ar.core.Config
 import com.google.ar.core.Frame
-import com.google.ar.core.RecordingConfig
 import com.google.ar.core.Session
-import com.google.ar.core.Track
 import android.opengl.GLES20
 import java.io.File
 import java.nio.ByteBuffer
@@ -27,7 +25,11 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
-import java.util.UUID
+import android.opengl.EGLConfig
+import android.opengl.EGLContext
+import android.opengl.EGLDisplay
+import android.opengl.EGLExt
+import android.opengl.EGLSurface
 import javax.microedition.khronos.opengles.GL10
 import kotlin.concurrent.Volatile
 import kotlin.math.max
@@ -56,18 +58,19 @@ import kotlin.math.sqrt
  *    the software YUV preview of Phase 1 was throttling the pipeline to
  *    ~3 Hz (acquireCameraImage/close round-trips serialized with the
  *    camera producer).
- *
- *  - START: session.startRecording(RecordingConfig) with an MP4 dataset
- *    (ARCore-native H.264, presentation timestamps, IMU) plus a custom
- *    JSON pose track (frame.recordTrackData per frame). STOP:
- *    session.stopRecording(), then export poses.json + session.json.
- *    Video↔pose timing is aligned by construction: the track data and the
- *    video frames share ARCore's internal frame clock, and each pose also
- *    carries the Android camera timestamp (frame.getAndroidCameraTimestamp)
- *    used by the HAL for video PTS.
- *
- *  - Geospatial mode is DISABLED explicitly: bildfang is a local-only
- *    logger, it neither needs nor stores location data.
+*
+*  - START: MediaCodecRecorder (H.264 hardware encoder, surface input) +
+*    MediaMuxer — bildfang's own encoder, its own presentation timestamps,
+*    its own muxing (P2a; ARCore's native recorder is dead on GrapheneOS,
+*    see docs/ROADMAP.md). The same camera frame is drawn into the
+*    encoder's input surface in the same GL loop as the preview, with a
+*    session-relative presentation time (android_camera timestamp minus
+*    the first encoded frame's; persisted as video_timebase). STOP:
+*    encoder flush, atomic finalization, then poses.json + video/frames.json
+*    + session.json.
+*
+*  - Geospatial mode is DISABLED explicitly: bildfang is a local-only
+*    logger, it neither needs nor stores location data.
  */
 class MainActivity : Activity() {
 
@@ -78,8 +81,10 @@ class MainActivity : Activity() {
     @Volatile private var pendingTextureRebind = false // consumed on the GL thread
     private var sessionStartMonoNs = 0L
 
-    // Recording state
-    private var trackUuid = UUID.randomUUID()
+    // Recording state (MediaCodec path — P2a; ARCore's native recorder is
+    // dead on GrapheneOS, see docs/ROADMAP.md P1/P2b)
+    private var recorder: MediaCodecRecorder? = null
+    private var encoderEglSurface: EGLSurface? = null // GL thread only
     private var sessionDir: File? = null
     private var videoFile: File? = null
     private var camImageSize: Size? = null
@@ -128,7 +133,6 @@ class MainActivity : Activity() {
     private val quadBufferId = IntArray(1) // glGenBuffers in onSurfaceCreated
     private var oesTextureId = 0
     private var lastLoggedCtn = -1
-    private var trackDataWarned = false
     // Canonical ARCore/BackgroundRenderer quad order for GL_TRIANGLE_STRIP:
     // BL, BR, TL, TR (NDC). Texture UVs start as a plain Y-flip and are
     // replaced by transformCoordinates2d once display geometry is valid.
@@ -265,11 +269,14 @@ class MainActivity : Activity() {
         }
 
         if (stopRequested) {
-                // stopRecording() from the GL thread (Session is not
-                // thread-safe); the export is posted to the UI after.
+                // Stop on the GL thread: no more frames after this one, and
+                // the encoder flush/finalize happens before the export is
+                // posted to the UI. (ARCore's native recorder is not used.
+                // )
                 stopRequested = false
+                val rec = recorder
                 try {
-                    s.stopRecording()
+                    rec?.stop()
                     recording = false
                     postToUi { finalizeExport() }
                 } catch (e: Exception) {
@@ -284,6 +291,10 @@ class MainActivity : Activity() {
                 consecutiveUpdateFailures = 0
                 onFrame(f)
                 drawPreview(f)
+                if (recording) {
+                    val prevSurf = EGL14.eglGetCurrentSurface(3) // EGL_SURFACE
+                    encodeFrame(f, prevSurf)
+                }
             } catch (e: Exception) {
                 consecutiveUpdateFailures++
                 if (consecutiveUpdateFailures == 1) {
@@ -326,6 +337,13 @@ class MainActivity : Activity() {
         if (texDirty || frame.hasDisplayGeometryChanged()) {
             if (tryUpdateQuadUvs(frame)) texDirty = false
         }
+        drawQuad(tex)
+    }
+
+    /** Draws the (already UV-mapped) camera quad with the current program.
+     *  Used for the preview surface and — after an eglMakeCurrent switch —
+     *  for the encoder input surface. GL thread. */
+    private fun drawQuad(tex: Int) {
         GLES20.glUseProgram(program[0])
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GL_TEXTURE_EXTERNAL_OES, tex)
@@ -336,6 +354,82 @@ class MainActivity : Activity() {
         GLES20.glVertexAttribPointer(aPosUv, 4, GLES20.GL_FLOAT, false, 16, 0)
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
         GLES20.glDisableVertexAttribArray(aPosUv)
+    }
+
+    /**
+     * Encodes the just-updated camera frame: borrows the current GL context
+     * on the encoder's window surface, draws the same OES quad, stamps the
+     * session-relative presentation time (P2a: `android_camera - origin`),
+     * swaps, and restores the preview surface. GL thread.
+     */
+    private fun encodeFrame(f: Frame, prevSurf: EGLSurface) {
+        val rec = recorder ?: return
+        val display = EGL14.eglGetCurrentDisplay()
+        val ctx = EGL14.eglGetCurrentContext()
+        var encSurf = encoderEglSurface
+        if (encSurf == null) {
+            encSurf = createEncoderEglSurface(display) ?: run {
+                rec.dropFrame()
+                return
+            }
+            encoderEglSurface = encSurf
+        }
+        if (!EGL14.eglMakeCurrent(display, encSurf, encSurf, ctx)) {
+            android.util.Log.e("bildfang", "eglMakeCurrent(encoder) failed")
+            rec.dropFrame()
+            return // makeCurrent failed: preview surface is still current
+        }
+        val tex = f.cameraTextureName.takeIf { it != 0 } ?: oesTextureId
+        if (tex == 0) {
+            EGL14.eglMakeCurrent(display, prevSurf, prevSurf, ctx)
+            rec.dropFrame()
+            return
+        }
+        drawQuad(tex)
+        val camTs = f.androidCameraTimestamp
+        val origin = rec.ensureOrigin(camTs)
+        EGLExt.eglPresentationTimeANDROID(display, encSurf, camTs - origin)
+        if (!EGL14.eglSwapBuffers(display, encSurf)) {
+            android.util.Log.e("bildfang", "eglSwapBuffers(encoder) failed")
+            EGL14.eglMakeCurrent(display, prevSurf, prevSurf, ctx)
+            rec.dropFrame()
+            return
+        }
+        EGL14.eglMakeCurrent(display, prevSurf, prevSurf, ctx)
+        rec.submitFrame(camTs, f.timestamp)
+        val pi = synchronized(posesLock) { poses.lastIndex }
+        rec.attachPoseIndex(rec.lastFrameIndex, pi)
+    }
+
+    /** EGL window surface over the encoder's input Surface. GL thread. */
+    private fun createEncoderEglSurface(display: EGLDisplay): EGLSurface? {
+        val rec = recorder ?: return null
+        val version = IntArray(1)
+        EGL14.eglQueryContext(display, EGL14.eglGetCurrentContext(),
+            EGL14.EGL_CONTEXT_CLIENT_VERSION, version, 0)
+        val renderable = if (version[0] >= 3) 0x40 else EGL14.EGL_OPENGL_ES2_BIT // EGL_OPENGL_ES3_BIT=0x40
+        val attribs = intArrayOf(
+            EGL14.EGL_RENDERABLE_TYPE, renderable,
+            EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT,
+            EGL14.EGL_RED_SIZE, 8,
+            EGL14.EGL_GREEN_SIZE, 8,
+            EGL14.EGL_BLUE_SIZE, 8,
+            EGL14.EGL_ALPHA_SIZE, 8,
+            EGL14.EGL_NONE, 0
+        )
+        val configs = arrayOfNulls<EGLConfig>(1)
+        val num = IntArray(1)
+        if (!EGL14.eglChooseConfig(display, attribs, 0, configs, 1, 0, num, 0) || num[0] == 0) {
+            android.util.Log.e("bildfang", "eglChooseConfig(encoder) failed")
+            return null
+        }
+        val surf = EGL14.eglCreateWindowSurface(display, configs[0], rec.encoderSurface,
+            intArrayOf(EGL14.EGL_NONE, 0), 0)
+        if (surf == EGL14.EGL_NO_SURFACE) {
+            android.util.Log.e("bildfang", "eglCreateWindowSurface(encoder) failed")
+            return null
+        }
+        return surf
     }
 
     /**
@@ -519,8 +613,15 @@ class MainActivity : Activity() {
     override fun onPause() {
         super.onPause()
         sessionActive = false
+        // A recording in progress is finalized (best effort) so the
+        // session is never left half-written; the manifest (P7) marks it.
+        if (recording) {
+            try { recorder?.stop() } catch (ignored: Exception) {}
+            recorder = null
+            recording = false
+        }
         try {
-            session?.pause() // auto-stops the recording (setAutoStopOnPause)
+            session?.pause()
         } catch (ignored: Exception) {
         }
     }
@@ -528,7 +629,7 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         super.onDestroy()
         try {
-            if (recording) session?.stopRecording()
+            if (recording) recorder?.stop()
             session?.pause()
             session?.close()
         } catch (ignored: Exception) {
@@ -561,9 +662,8 @@ class MainActivity : Activity() {
         }
 
         val dir = createSessionDir()
-        videoFile = File(dir, "video.mp4")
+        videoFile = File(dir, "video/camera.mp4")
         sessionDir = dir
-        trackUuid = UUID.randomUUID()
         sessionStartMonoNs = SystemClock.elapsedRealtimeNanos()
         fps = 0f
         drawFrameCount = 0
@@ -576,39 +676,21 @@ class MainActivity : Activity() {
             discontinuities.clear()
         }
 
-        val cfg = RecordingConfig(s)
-            .setMp4DatasetUri(Uri.fromFile(videoFile!!))
-            .setAutoStopOnPause(true)
-            .addTrack(
-                Track(s)
-                    .setId(trackUuid)
-                    .setMimeType("application/json")
-                    .setMetadata(
-                        // Native byte order, like the VBO: ARCore hands this
-                        // buffer to its native layer.
-                        ByteBuffer.allocateDirect(
-                            "bildfang-capture/v1 pose track: one compact JSON pose per video frame"
-                                .encodeToByteArray().size
-                        ).apply {
-                            order(ByteOrder.nativeOrder())
-                            put(
-                                "bildfang-capture/v1 pose track: one compact JSON pose per video frame"
-                                    .encodeToByteArray()
-                            )
-                        }
-                    )
-            )
-        try {
-            s.startRecording(cfg)
-            recording = true
-            startBtn.isEnabled = false
-            stopBtn.isEnabled = true
-            statusView.setText(R.string.status_recording)
-        } catch (e: Exception) {
-            android.util.Log.e("bildfang", "startRecording failed", e)
-            statusView.text = "Recording failed: ${e.javaClass.simpleName}: ${e.message ?: e}"
-            startBtn.isEnabled = true
+        // P2a: MediaCodec H.264 (surface input) + MediaMuxer — our recorder,
+        // our timestamps, our muxing. 1080p30 / 25 Mbit/s initial experiment
+        // (reconstruction quality > file size; measure, don't assume).
+        val rec = MediaCodecRecorder(1920, 1080, 30, 25_000_000, File(dir, "video"))
+        if (!rec.start()) {
+            android.util.Log.e("bildfang", "recorder start failed", Exception(rec.status()))
+            statusView.text = "Recording failed: ${rec.status()}"
+            return
         }
+        recorder = rec
+        encoderEglSurface = null // (re)created lazily on the GL thread
+        recording = true
+        startBtn.isEnabled = false
+        stopBtn.isEnabled = true
+        statusView.setText(R.string.status_recording)
     }
 
     private fun stopRecording() {
@@ -665,24 +747,34 @@ class MainActivity : Activity() {
                 "note": "trajectory estimate, not ground truth"
               },
               "video": {
-                "file": "video.mp4",
-                "producer": "ARCore native recording (H.264, presentation timestamps, IMU)",
+                "file": "video/camera.mp4",
+                "producer": "bildfang MediaCodecRecorder (H.264 hardware encoder, surface input, MediaMuxer)",
+                "resolution": "1920x1080",
+                "fps_nominal": 30,
+                "bitrate_bps": 25000000,
                 "cpu_image_resolution": ${if (v == null) "null" else "\"${v.width}x${v.height}\""},
-                "fps_range": ${if (camFpsRange.isEmpty()) "null" else "\"$camFpsRange\""}
+                "fps_range": ${if (camFpsRange.isEmpty()) "null" else "\"$camFpsRange\""},
+                "video_timebase": {
+                  "source_clock": "android_camera",
+                  "origin_raw_ns": ${recorder?.timebaseOriginNs ?: 0L},
+                  "unit": "ns"
+                },
+                "counters": {
+                  "camera_frames_observed": ${recorder?.counters?.cameraFramesObserved ?: 0L},
+                  "frames_submitted": ${recorder?.counters?.framesSubmitted ?: 0L},
+                  "frames_encoded": ${recorder?.counters?.framesEncoded ?: 0L},
+                  "frames_muxed": ${recorder?.counters?.framesMuxed ?: 0L},
+                  "frames_dropped": ${recorder?.counters?.framesDropped ?: 0L}
+                }
               },
-              "pose_track": {
-                "uuid": "$trackUuid",
-                "mime": "application/json",
-                "alignment": "one record per video frame; PTS shared with the video track"
-              },
+              "frames_file": "video/frames.json",
               "poses_file": "poses/poses.json",
               "discontinuities_file": "poses/discontinuities.json",
               "clock": {
-                "frame_timestamp_ns": "ARCore frame clock, epoch unknown (fixed, likely unix ns)",
                 "anchor_frame_ts": $frameTsAnchor,
                 "anchor_unix_ms": $anchorUnixMs,
                 "anchor_monotonic_ns": $anchorMonoNs,
-                "poses_timestamps": "relative to anchor_frame_ts"
+                "note": "anchor_frame_ts is the raw ARCore frame clock (epoch unknown/opaque); poses are session-relative from it; see docs/capture-format.md clock domains"
               }
             }
         """.trimIndent()
@@ -762,21 +854,6 @@ class MainActivity : Activity() {
                 lastPose = r
             }
 
-            // Pose into the recording: one compact JSON record per frame,
-            // stamped by ARCore with the same PTS as the video frame.
-            try {
-                val json = "{\"t\":$frameTs,\"tcam\":${frame.androidCameraTimestamp}," +
-                    "\"p\":[$t[0],$t[1],$t[2]]," +
-                    "\"q\":[$q[0],$q[1],$q[2],$q[3]]," +
-                    "\"s\":\"$state\"}"
-                frame.recordTrackData(trackUuid, ByteBuffer.wrap(json.encodeToByteArray()))
-            } catch (e: Exception) {
-                // non-fatal: poses.json is the canonical export
-                if (!trackDataWarned) {
-                    trackDataWarned = true
-                    android.util.Log.w("bildfang", "recordTrackData (first failure only)", e)
-                }
-            }
         }
 
         val elapsedNs = frame.timestamp - frameTsAnchor
