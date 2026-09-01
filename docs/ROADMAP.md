@@ -35,7 +35,7 @@ filter, discard, or silently alter the preserved raw capture.
 | Phase | Title | Status | Notes |
 |-------|-------|--------|-------|
 | P0 | Freeze preview baseline | **DONE** | `8674383` verified on Pixel 7 / GrapheneOS 17 / ARCore 1.54 (2026-09-01) |
-| P1 | First real end-to-end capture | **BLOCKED (device bug, see below)** | ARCore 1.54 `startRecording()` → `FatalException` on Pixel 7 / GrapheneOS 17; bisection complete |
+| P1 | First real end-to-end capture | **BLOCKED (device bug, confirmed 09:40 UTC in lit room w/ active tracking)** | ARCore 1.54 `startRecording()` → `FatalException` on Pixel 7 / GrapheneOS 17; bisection complete incl. the tracking-state variable; see status below |
 | P2 | ARCore custom-track playback round-trip | not started | |
 | P3 | Clock-domain model | **DONE** | `capture-format.md` rewritten: named domains (arcore_frame / android_camera / android_monotonic / wall_clock / sensor / container_pts), guaranteed/measured/unknown, no epoch claims; `frame_timestamp_raw_ns` stored per pose |
 | P4 | De-contradict capture-format.md clocks | **DONE** | same rewrite; "one shared clock" invariant removed; IMU + invariants sections aligned with the domain model |
@@ -173,6 +173,54 @@ Also verified tonight (useful regardless):
 - **App left ready on the phone**: clean build installed, session resumed,
   screen kept on via `svc power stayon true` (charging).
   **Morning test — just tap START and watch the room.**
+
+### Status — 2026-09-01 (morning, 09:39 UTC, lit room, ACTIVE TRACKING)
+
+**Decisive result: the tracking hypothesis is dead.**
+
+The phone was pointed at a well-lit scene (wooden floor) with the tracker
+**live** (status line: `TRACKING · 31.6 fps`, poses flowing). Tapping START
+reproduced the identical failure, now with the full stack captured:
+
+```text
+09:39:55.653  input tap 275 2178                      (START)
+09:39:55.728  W native: recorder_util.cc:68] Disable recording hinge
+             angle as it's not supported!             (harmless info line)
+09:39:55.730  E bildfang: startRecording failed
+09:39:55.730  com.google.ar.core.exceptions.FatalException
+09:39:55.730    at com.google.ar.core.Session.nativeStartRecording(Native Method)
+09:39:55.730    at com.google.ar.core.Session.startRecording(Session.java:2)
+09:39:55.730    at app.bildfang.MainActivity.startRecording(MainActivity.kt:602)
+```
+
+No files were created; the session survived (preview kept running, no
+`session.cc:1139` fatal, camera HAL untouched). The native recorder prints
+**no reason** before dying — the failure is inside `nativeStartRecording`'s
+own initialization, ~2 ms after entry, before any encoder or camera work.
+
+**Verdict:** ARCore 1.54's native MP4 recorder is broken on
+Pixel 7 / GrapheneOS 17 — independent of tracking state, scene lighting,
+`CameraConfig`, custom tracks, and URI source. (Possible GrapheneOS
+seccomp/dmabuf interaction on the recorder's native side, but the app
+process has no access to ARCore's internals to confirm; the camera
+preview path works fine under the same seccomp profile.)
+
+**Remaining options (decision pending, see open items):**
+
+1. **Test the Pixel 9 Pro** — different SoC/HAL (Tensor G5); if its
+   ARCore is certified *and* its recorder works, the room capture can
+   proceed on that device and the Pixel 7 bug is a reported-then-deferred
+   upstream issue. Open question: is the 9 Pro even on ARCore's certified
+   device list at all? (absent from all public lists checked — the
+   on-device `checkAvailability()` line is the only answer.)
+2. **MediaCodec self-encode fallback** (the design doc's original plan, and
+   the P7 target anyway): encode `Image`/`HardwareBuffer` frames ourselves
+   with `Frame.getAndroidCameraTimestamp()` as presentation PTS, mux via
+   MediaMuxer, and write IMU/poses/intrinsics files ourselves. More code,
+   but full control of every clock domain and it removes the dependency on
+   a broken native component.
+3. **File an upstream bug** (Google ARCore / GrapheneOS) with the bisection
+   log above — low priority, but cheap to do once the format is frozen.
 
 
 ## P2 — Validate ARCore Recording custom-track behavior
