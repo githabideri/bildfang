@@ -2,6 +2,7 @@ package app.bildfang
 
 import android.Manifest
 import android.app.Activity
+import android.view.Display
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
@@ -20,6 +21,7 @@ import com.google.ar.core.Track
 import android.opengl.GLES20
 import java.io.File
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.security.SecureRandom
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -72,6 +74,7 @@ class MainActivity : Activity() {
     @Volatile private var sessionActive = false
     @Volatile private var recording = false
     @Volatile private var stopRequested = false
+    @Volatile private var pendingTextureRebind = false // consumed on the GL thread
     private var sessionStartMonoNs = 0L
 
     // Recording state
@@ -118,42 +121,64 @@ class MainActivity : Activity() {
     private var aPosUv = 0
     private var uTex = 0
     private var uDebugRed = 0
-    // Toggle to force a solid-red frame (compositing check).
+    // debug: force solid red to test GL compositing vs texture sampling
     private var debugRed = false
     private val quadBufferId = IntArray(1) // glGenBuffers in onSurfaceCreated
     private var oesTextureId = 0
+    private var lastLoggedCtn = -1
+    // Canonical ARCore/BackgroundRenderer quad order for GL_TRIANGLE_STRIP:
+    // BL, BR, TL, TR (NDC). Texture UVs start as a plain Y-flip and are
+    // replaced by transformCoordinates2d once display geometry is valid.
+    private val quadNdc = floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f)
+    private val quadTex = floatArrayOf(0f, 1f, 1f, 1f, 0f, 0f, 1f, 0f)
+    private var texDirty = true
 
     private val renderer = object : GLSurfaceView.Renderer {
         override fun onSurfaceCreated(gl: GL10?, config: javax.microedition.khronos.egl.EGLConfig?) {
             program[0] = buildProgram(
-                "attribute vec4 aPosUv;\nvarying vec2 vUv;\n" +
+                // GLSL ES 3.00. The context on current devices is ES3.x even
+                // when client version 2 is requested; in that mode the GLSL-100
+                // `#extension GL_OES_EGL_image_external` path compiled but
+                // sampled black on-device (Pixel 7 / Mali r54, 2026-09-01).
+                // ES 3.00 needs the _essl3 variant of the external-texture
+                // extension (samplerExternalOES is only core from ES 4.00 on);
+                // without the directive the shader fails to compile on Mali.
+                "#version 300 es\n" +
+                    "layout(location = 0) in vec4 aPosUv;\n" +
+                    "out vec2 vUv;\n" +
                     "void main() { vUv = aPosUv.zw; gl_Position = vec4(aPosUv.xy, 0.0, 1.0); }",
-                // GLSL ES 100 on the (ES2-requested, ES3.2-actual) context;
-                // the OES external-texture extension compiled fine on-device
-                // (Pixel 7 / Mali r54, 2026-09-01).
-                "#extension GL_OES_EGL_image_external : require\n" +
-                    "precision mediump float;\nvarying vec2 vUv;\nuniform sampler2D uTex;\n" +
+                "#version 300 es\n" +
+                    "#extension GL_OES_EGL_image_external_essl3 : require\n" +
+                    "precision mediump float;\n" +
+                    "in vec2 vUv;\nout vec4 fragColor;\n" +
+                    "uniform highp samplerExternalOES uTex;\n" +
                     "uniform float uDebugRed;\n" +
-                    "void main() { if (uDebugRed > 0.5) { gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0); } else { gl_FragColor = texture2D(uTex, vUv); } }"
+                    "void main() { if (uDebugRed > 0.5) { fragColor = vec4(1.0, 0.0, 0.0, 1.0); } else { fragColor = texture(uTex, vUv); } }"
             )
             aPosUv = GLES20.glGetAttribLocation(program[0], "aPosUv")
             uTex = GLES20.glGetUniformLocation(program[0], "uTex")
             uDebugRed = GLES20.glGetUniformLocation(program[0], "uDebugRed")
 
-            // 4 corners: xy = clip space, zw = texture uv (Y flipped:
-            // camera image is top-down, clip space origin is bottom-left)
-            val quad = floatArrayOf(
-                -1f, -1f, 0f, 1f,
-                1f, -1f, 1f, 1f,
-                1f, 1f, 1f, 0f,
-                -1f, 1f, 0f, 0f
-            )
-            GLES20.glGenBuffers(1, quadBufferId, 0)
-            GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, quadBufferId[0])
-            val buf = ByteBuffer.allocate(quad.size * 4)
-            buf.asFloatBuffer().put(quad)
-            buf.rewind() // glBufferData reads from position(); put() advanced it past the data
-            GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, quad.size * 4, buf, GLES20.GL_STATIC_DRAW)
+            // 4 corners: xy = clip space, zw = texture uv (Y flipped: camera
+            // image is top-down, clip space origin is bottom-left).
+            //
+            // CRITICAL (root cause of the invisible-quad bug, confirmed
+            // 2026-09-01): the driver on ARM reads buffer bytes in native
+            // (little) endian, but ByteBuffer.allocate()/wrap() are
+            // BIG_ENDIAN by default — the JNI copy passes raw bytes, so the
+            // vertex floats came out byte-swapped (1.0f → ~4e-41), collapsing
+            // the whole quad to a zero-area point near the origin. glClear was
+            // still visible, glGetError stayed 0. Must use
+            // allocateDirect + ByteOrder.nativeOrder (as Google's
+            // BackgroundRenderer does).
+            val interleaved = FloatArray(16)
+            for (i in 0 until 4) {
+                interleaved[i * 4] = quadNdc[i * 2]
+                interleaved[i * 4 + 1] = quadNdc[i * 2 + 1]
+                interleaved[i * 4 + 2] = quadTex[i * 2]
+                interleaved[i * 4 + 3] = quadTex[i * 2 + 1]
+            }
+            uploadQuad(interleaved)
 
             // The camera texture ARCore writes into. 1.54 expects an
             // external OES texture registered via setCameraTextureName.
@@ -185,9 +210,13 @@ class MainActivity : Activity() {
             // Required before frames flow: ARCore warns "Display geometry
             // has an invalid width: 0" and the frame manager withholds
             // frames until the viewport is known (verified on-device
-            // 2026-09-01).
+            // 2026-09-01). NOTE: the argument order is
+            // (rotation, width, height) — rotation is a Surface.ROTATION_x
+            // constant of the *display*, not a pixel dimension.
             try {
-                session?.setDisplayGeometry(width, height, 60)
+                val dm = glView.context.getSystemService(android.hardware.display.DisplayManager::class.java)
+                val rotation = dm.getDisplay(Display.DEFAULT_DISPLAY).rotation
+                session?.setDisplayGeometry(rotation, width, height)
             } catch (e: Exception) {
                 android.util.Log.w("bildfang", "setDisplayGeometry: $e")
             }
@@ -208,6 +237,11 @@ class MainActivity : Activity() {
                     try {
                         s.resume()
                         sessionActive = true
+                        // Re-register: the texture may have been registered
+                        // while the session was not yet active (onSurfaceCreated
+                        // races the first resume), and an inactive session may
+                        // not have bound it.
+                        if (oesTextureId != 0) s.setCameraTextureName(oesTextureId)
                     } catch (e: Exception) {
                         if (consecutiveUpdateFailures == 0) {
                             android.util.Log.w("bildfang", "resume() failing", e)
@@ -215,10 +249,19 @@ class MainActivity : Activity() {
                         }
                     }
                 }
-                return
+            if (pendingTextureRebind && oesTextureId != 0) {
+                pendingTextureRebind = false
+                s.setCameraTextureName(oesTextureId)
             }
+            return
+        }
 
-            if (stopRequested) {
+        if (pendingTextureRebind) {
+            pendingTextureRebind = false
+            if (oesTextureId != 0) s.setCameraTextureName(oesTextureId)
+        }
+
+        if (stopRequested) {
                 // stopRecording() from the GL thread (Session is not
                 // thread-safe); the export is posted to the UI after.
                 stopRequested = false
@@ -255,27 +298,30 @@ class MainActivity : Activity() {
     /**
      * Passthrough of the ARCore camera texture into the GL view.
      *
-     * OPEN ISSUE (2026-09-01, Pixel 7 / GrapheneOS 17 / ARCore 1.54):
-     * the EGL surface is composited (the clear color is visible on
-     * screen, proving setZOrderOnTop + transparent window work) but the
-     * quad drawn here is not visible, even though program/link/attribute/
-     * buffer/viewport are all valid and glGetError() stays 0. Both a
-     * solid-red shader and the OES-sampling shader reproduce it. Next
-     * candidates: z-order media overlay instead of on-top, EGL config
-     * interplay with the ES3.2 context, or the ARCore-owned GL threads
-     * interfering with our surface. The tracking/pose pipeline (onFrame)
-     * is unaffected — poses.json records are correct regardless.
+     * UV mapping: while display geometry is (in)valid, ARCore tells us how
+     * to map the screen quad into texture space via transformCoordinates2d
+     * (sensor orientation, display rotation, aspect, center crop) — the
+     * same approach as the official ARCore BackgroundRenderer. Until the
+     * first valid transform, a plain Y-flipped UV is used.
      */
     private fun drawPreview(frame: Frame) {
         if (program[0] == 0) return
         // 1.54 may return 0 (ARCore does not own the texture — the app's
         // setCameraTextureName target is the one being filled).
-        val tex = frame.cameraTextureName.takeIf { it != 0 } ?: oesTextureId
+        val ctn = frame.cameraTextureName
+        if (ctn != 0 && ctn != lastLoggedCtn) {
+            lastLoggedCtn = ctn
+            android.util.Log.w("bildfang", "frame.cameraTextureName=$ctn (oes=$oesTextureId)")
+        }
+        val tex = ctn.takeIf { it != 0 } ?: oesTextureId
         if (tex == 0) {
             if (drawFrameCount % 60 == 0) {
                 android.util.Log.w("bildfang", "no texture: frameTex=${frame.cameraTextureName} oes=$oesTextureId")
             }
             return
+        }
+        if (texDirty || frame.hasDisplayGeometryChanged()) {
+            if (tryUpdateQuadUvs(frame)) texDirty = false
         }
         GLES20.glUseProgram(program[0])
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
@@ -289,6 +335,46 @@ class MainActivity : Activity() {
         GLES20.glDisableVertexAttribArray(aPosUv)
     }
 
+    /**
+     * Ask ARCore to remap the screen quad into texture space (sensor
+     * orientation, display rotation, aspect ratio, center crop). Returns
+     * true on success; the quad keeps its previous UVs on failure.
+     * GL thread.
+     */
+    private fun tryUpdateQuadUvs(frame: Frame): Boolean {
+        try {
+            frame.transformCoordinates2d(
+                com.google.ar.core.Coordinates2d.OPENGL_NORMALIZED_DEVICE_COORDINATES,
+                quadNdc,
+                com.google.ar.core.Coordinates2d.TEXTURE_NORMALIZED,
+                quadTex
+            )
+            val interleaved = FloatArray(16)
+            for (i in 0 until 4) {
+                interleaved[i * 4] = quadNdc[i * 2]
+                interleaved[i * 4 + 1] = quadNdc[i * 2 + 1]
+                interleaved[i * 4 + 2] = quadTex[i * 2]
+                interleaved[i * 4 + 3] = quadTex[i * 2 + 1]
+            }
+            uploadQuad(interleaved)
+            return true
+        } catch (e: Exception) {
+            android.util.Log.w("bildfang", "transformCoordinates2d: ${e.message}")
+            return false
+        }
+    }
+
+    /** Rebuilds the interleaved quad VBO with native byte order. GL thread. */
+    private fun uploadQuad(quad: FloatArray) {
+        if (quadBufferId[0] == 0) GLES20.glGenBuffers(1, quadBufferId, 0)
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, quadBufferId[0])
+        val bytes = ByteBuffer.allocateDirect(quad.size * 4)
+            .order(ByteOrder.nativeOrder())
+        bytes.asFloatBuffer().put(quad)
+        bytes.position(0)
+        GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, quad.size * 4, bytes, GLES20.GL_STATIC_DRAW)
+    }
+
     private fun buildProgram(vs: String, fs: String): Int {
         fun compile(type: Int, src: String): Int {
             val sh = GLES20.glCreateShader(type)
@@ -297,8 +383,9 @@ class MainActivity : Activity() {
             val ok = IntArray(1)
             GLES20.glGetShaderiv(sh, GLES20.GL_COMPILE_STATUS, ok, 0)
             if (ok[0] == 0) {
+                val log = GLES20.glGetShaderInfoLog(sh)
                 GLES20.glDeleteShader(sh)
-                throw RuntimeException("shader compile: " + GLES20.glGetShaderInfoLog(sh))
+                throw RuntimeException("shader compile (type=$type) infoLog='$log' SRC: $src")
             }
             return sh
         }
@@ -379,6 +466,7 @@ class MainActivity : Activity() {
             val s = Session(this)
             val cfg = s.config
                 .setUpdateMode(Config.UpdateMode.LATEST_CAMERA_IMAGE)
+                .setTextureUpdateMode(Config.TextureUpdateMode.BIND_TO_TEXTURE_EXTERNAL_OES)
             if (s.isGeospatialModeSupported(Config.GeospatialMode.DISABLED)) {
                 cfg.setGeospatialMode(Config.GeospatialMode.DISABLED)
             }
@@ -419,6 +507,7 @@ class MainActivity : Activity() {
         try {
             session?.resume()
             sessionActive = true
+            pendingTextureRebind = true
         } catch (ignored: Exception) {
             // permission pending or camera busy; GL loop retries
         }
