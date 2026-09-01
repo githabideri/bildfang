@@ -35,13 +35,14 @@ filter, discard, or silently alter the preserved raw capture.
 | Phase | Title | Status | Notes |
 |-------|-------|--------|-------|
 | P0 | Freeze preview baseline | **DONE** | `8674383` verified on Pixel 7 / GrapheneOS 17 / ARCore 1.54 (2026-09-01) |
-| P1 | First real end-to-end capture | **BLOCKED (device bug, confirmed 09:40 UTC in lit room w/ active tracking)** | ARCore 1.54 `startRecording()` → `FatalException` on Pixel 7 / GrapheneOS 17; bisection complete incl. the tracking-state variable; see status below |
-| P2 | ARCore custom-track playback round-trip | not started | |
+| P1 | First real end-to-end capture | **IN PROGRESS — MediaCodec path** | ARCore native recorder dead on Pixel 7 (device bug, bisection below); per 2026-09-01 decision MediaCodec self-encode is the primary path, native recording is capability-dependent only. Acceptance criteria below. |
+| P2a | MediaCodec timestamp/mux round-trip | **IN PROGRESS (required)** | camera ts → normalized PTS → encoder PTS → MP4 PTS → ffprobe; quantify residual. Unblocks P1. |
+| P2b | ARCore native custom-track playback round-trip | **optional / capability-dependent** | only on devices where native recording works (Pixel 9 Pro check pending); must not block v1 |
 | P3 | Clock-domain model | **DONE** | `capture-format.md` rewritten: named domains (arcore_frame / android_camera / android_monotonic / wall_clock / sensor / container_pts), guaranteed/measured/unknown, no epoch claims; `frame_timestamp_raw_ns` stored per pose |
 | P4 | De-contradict capture-format.md clocks | **DONE** | same rewrite; "one shared clock" invariant removed; IMU + invariants sections aligned with the domain model |
 | P5 | Raw poses + trajectory_discontinuity | **IN PROGRESS** | multi-signal discontinuity detection → `poses/discontinuities.json` (informational, not a verdict); `translation_raw` + explicit SE(3) segment transform deferred until after v1 live-verify (schema freeze, step 9) |
 | P6 | Intrinsics: source-tagged, validated scaling | not started | |
-| P7 | Full preservation package + manifest | not started | |
+| P7 | Full preservation package + manifest | not started | now on top of the MediaCodec recorder: `video/camera.mp4` + authoritative `frames.json`, counters in manifest, manifest written last |
 | P8 | Raw IMU logging | not started | |
 | P9 | Cheap capture-health signals | not started | |
 | P10 | Local visual continuity | not started | |
@@ -76,27 +77,55 @@ P1 validation is complete):
    `TextureUpdateMode.BIND_TO_TEXTURE_EXTERNAL_OES` explicitly
    (`Frame.getCameraTextureName()` returns 0 otherwise in 1.54).
 
-## P1 — First real end-to-end capture (IN PROGRESS — highest priority)
+## P1 — First real end-to-end capture (IN PROGRESS — MediaCodec path)
 
 ```text
 START -> walk through room 30-90 s -> STOP -> pull files
 ```
 
-The session must be inspectable **independently of the Android app**:
+The session must be inspectable **independently of the Android app**.
+**Decision 2026-09-01 (ChatGPT review of `4186c4f`): the ARCore native
+recorder is no longer a dependency.** MediaCodec self-encoding is the
+primary, portable, preservation-grade path (our recorder, our timestamps,
+our muxing); ARCore native dataset recording becomes an optional
+capability (P2b) where it works.
 
-- MP4 exists, playable; duration plausible
-- resolution/FPS plausible
-- pose count plausible (~camera frame rate)
-- timestamps monotonic where expected
+**P1 is DONE only after an actual 30–90 s walk produces a pulled-off-device
+capture that passes all of:**
+
+- MP4 playable
+- expected resolution
+- expected approximate frame rate
+- sensible duration
+- strictly monotonic video PTS
+- no unexplained duplicate timestamps
+- no black/corrupt/repeated frames
+- poses exported (`poses/poses.json`)
+- `frames.json` exported (authoritative source-frame → encoded-frame map)
+- every encoded frame traceable to a source camera timestamp
+- every encoded frame associable with a pose, or explicitly marked otherwise
 - trajectory physically plausible
-- START/STOP does not truncate/corrupt the MP4
+- frame/drop counters consistent (`camera_frames_observed` / `submitted` /
+  `encoded` / `muxed` / `dropped`)
+- ffprobe output sane
+- start and stop do not truncate the container
+
+**Plus:**
+
+- one **2–3 minute stress recording**: no memory growth, no encoder
+  starvation, no GL degradation, no severe thermal collapse, valid
+  finalized MP4;
+- one **interrupted capture**: must be clearly marked incomplete, never
+  silently appear valid (manifest last, P7).
 
 Tooling: `tools/inspect_capture.py` — canonical session validator
-(ffprobe + JSON checks, human-readable report). `tools/plot_trajectory.py`
+(ffprobe + JSON checks, human-readable report); extend it for
+`frames.json` + counters as part of P1. `tools/plot_trajectory.py`
 already exists.
 
-Note: current layout writes `video.mp4` at the session root; the
-`video/camera.mp4` layout is P7's target and not required for P1.
+The capture layout is now P7's from the start (MediaCodec lets us choose
+it): `video/camera.mp4` + `video/frames.json`, `poses/poses.json` (+
+`discontinuities.json`), `session.json`, and `manifest.json` last.
 
 ### Status — 2026-09-01 (night session, Pixel 7, dark room)
 
@@ -223,31 +252,144 @@ preview path works fine under the same seccomp profile.)
    log above — low priority, but cheap to do once the format is frozen.
 
 
-## P2 — Validate ARCore Recording custom-track behavior
+## P2a — MediaCodec recorder: architecture, timestamp round-trip (REQUIRED)
 
-Design: `RecordingConfig` + MP4 dataset URI + custom `Track(UUID)` +
-per-frame `Frame.recordTrackData(...)`. Supported use case: data written
-to a Frame is returned at the same Frame during dataset playback, and
-`TrackData.getFrameTimestamp()` is defined to equal the recording
-Frame's `Frame.getTimestamp()`.
+**The primary, portable, preservation-grade recorder.** Replaces the
+ARCore-native recorder (broken on Pixel 7 / GrapheneOS 17 — see P1
+status) with one where frame timestamps and muxing are under our control.
 
-Use this as the **canonical ARCore-native synchronization test**:
+### Architecture — Surface-based, no CPU image path
 
-1. open the recorded dataset through ARCore,
-2. play it back,
-3. `getUpdatedTrackData(trackUuid)` per frame,
-4. record playback frame ts / track-data frame ts / payload ts,
-5. verify exact correspondence.
-
-More authoritative than wall-clock inference. Keep `poses.json` as an
-independent sidecar regardless:
+Do **not** use `Frame.acquireCameraImage()` / CPU YUV conversion as the
+recording path (CPU image acquisition measurably throttles ARCore).
 
 ```text
-camera.mp4      embedded custom pose track
-poses.json      independent preservation-friendly representation
+ARCore GL_TEXTURE_EXTERNAL_OES
+             |  (one OES texture per GL context, Session.setCameraTextureNames)
+      +------+------+
+      |             |
+      v             v
+   preview      MediaCodec input Surface (same GL update loop,
+                 eglMakeCurrent onto a second context bound to the
+                 encoder surface)
+                     |
+                     v
+                  H.264  -->  MediaMuxer  -->  video/camera.mp4
 ```
 
-Redundancy is intentional.
+- one `session.update()` per loop; after it, render the preview quad to
+  the preview surface **and** (if recording) the same frame to the encoder
+  surface — no second update, no dropped frames by design
+- recorder abstraction so the activity is not coupled to either
+  implementation:
+
+```kotlin
+interface VideoRecorder {
+    fun start(...)     // returns config (timebase origin, counters handle)
+    fun submitFrame(...)  // called from the GL update loop per new frame
+    fun stop()         // flush encoder + finalize muxer (atomic)
+    fun status()       // counters, state, warnings
+}
+// MediaCodecRecorder      -- default, portable, preservation-grade
+// ArCoreDatasetRecorder   -- capability-dependent supplemental (P2b)
+```
+
+### Timestamp design (P3 domain model, applied to video)
+
+For each camera frame retain the raw values:
+
+- `Frame.getTimestamp()` (`arcore_frame`, epoch unknown/opaque)
+- `Frame.getAndroidCameraTimestamp()` (`android_camera`)
+
+**Video PTS is session-relative, derived from the camera clock — never
+the raw camera timestamp as MP4 PTS:**
+
+```text
+video_pts_ns = android_camera_timestamp_ns
+             - first_encoded_android_camera_timestamp_ns
+```
+
+Set it on the encoder input surface via the EGL presentation-time
+mechanism (`eglPresentationTimeANDROID` before `eglSwapBuffers`) *before*
+sending the buffer. Persist the exact origin in `session.json` so the
+transformation is explicit and reversible:
+
+```json
+"video_timebase": {
+  "source_clock": "android_camera",
+  "origin_raw_ns": 1234567890123456,
+  "unit": "ns"
+}
+```
+
+### Encoder target (first version — conservative)
+
+- AVC / H.264, **hardware encoder**, Surface input, 30 fps target
+- rate control: CQ if the device encoder supports it and behaves
+  consistently, else high-bitrate VBR; CBR only with a concrete reason
+- deliberately generous initial bitrate, measured not assumed:
+  ~50–80 Mbit/s for 4K30, ~15–30 Mbit/s for 1080p30 (reconstruction
+  quality > file size)
+- short GOP: I-frame interval ≈ 1 s
+- no advanced encoding features until timestamp behavior is verified
+
+### No silent drops
+
+Counters, always in diagnostics/export metadata:
+
+```
+camera_frames_observed  frames_submitted_to_encoder
+frames_encoded          frames_muxed          frames_dropped
+```
+
+`video/frames.json` is the **authoritative** mapping between source
+observation and encoded media. One entry per encoded frame:
+
+```json
+{
+  "idx": 482,
+  "pts_ns": 16066712345,
+  "android_camera_timestamp_ns": 834129912345678,
+  "arcore_frame_timestamp_raw_ns": 1782345678901234567,
+  "pose_index": 482
+}
+```
+
+If pose/frame correspondence is not exactly 1:1, encode the actual
+relationship (or explicit null) — never pretend it is. The encoder may
+transform representation; it may **not** hide timing or frame-loss
+behavior. Metadata must always answer offline: which camera observation
+produced this frame, when it was acquired, which pose belongs to it,
+what was dropped, and which clock transformation was applied.
+
+### The round-trip test (P2a acceptance)
+
+Prove the chain end-to-end on-device and quantify the residual at each
+hop:
+
+```text
+android camera timestamp
+    -> normalized encoder presentation time
+    -> MediaCodec output BufferInfo.presentationTimeUs
+    -> MediaMuxer MP4 PTS
+    -> ffprobe / MediaExtractor
+```
+
+Expected: identity or a constant, small, documented offset (muxer
+rounding). Any larger drift is a bug, not a property.
+
+## P2b — ARCore native dataset recording (optional / capability-dependent)
+
+`RecordingConfig` + MP4 dataset URI + custom `Track(UUID)` + per-frame
+`Frame.recordTrackData(...)`: data written to a Frame is returned at the
+same Frame during dataset playback, and `TrackData.getFrameTimestamp()` is
+defined to equal the recording Frame's `Frame.getTimestamp()` — the
+canonical ARCore-native synchronization test **where the native recorder
+works** (Pixel 9 Pro capability check pending; dead on Pixel 7 /
+GrapheneOS 17, see P1 status). If it works on a supported device, ARCore
+custom-track playback is valuable as a supplemental capability; it must
+**not** block Bildfang v1. Keep `poses.json` as an independent sidecar
+regardless — redundancy is intentional.
 
 ## P3 — Fix the clock model before freezing capture/v1
 
