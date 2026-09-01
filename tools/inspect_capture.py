@@ -4,9 +4,16 @@
 Usage:
     python3 tools/inspect_capture.py <path-to-capture-...>
 
-Validates the three P1 artifacts (video.mp4, poses/poses.json, session.json)
-and prints a report. Exits 0 if all checks pass, 1 if any fail, 2 on
-missing inputs. ffprobe must be on PATH for the video checks.
+Validates the P1/P2a artifacts (video/camera.mp4 or legacy video.mp4,
+video/frames.json, poses/poses.json, session.json) and prints a report.
+Exits 0 if all checks pass, 1 if any fail, 2 on missing inputs. ffprobe
+must be on PATH for the video checks.
+
+The frames.json section performs the P2a timestamp round-trip: it
+re-derives pts from the persisted video_timebase origin, then compares
+the application-level PTS against the MP4 container's decoded PTS and
+quantifies the residual in microseconds (bounded by the container
+timebase, e.g. 1/11025 -> ~91 us max quantization).
 
 This is intentionally conservative: it reports *relationships* (and
 flagged unknowns), it does not assert clock-domain equivalences.
@@ -91,21 +98,25 @@ def main():
 
     # ------------------------------------------------------------------
     print("\nvideo")
-    video_p = session_dir / "video.mp4"
+    video_p = session_dir / "video" / "camera.mp4"
+    if not video_p.is_file():
+        legacy = session_dir / "video.mp4"  # pre-P2a layout
+        video_p = legacy if legacy.is_file() else video_p
     video_ok = video_p.is_file() and video_p.stat().st_size > 0
-    check("video.mp4 exists", video_ok,
+    check(f"video file exists ({video_p.name})", video_ok,
           f"{video_p.stat().st_size / 1e6:.1f} MiB" if video_ok else "missing")
     probe = probe_video(video_p) if video_ok else None
-    if probe is None:
-        check("ffprobe parses the file", False, "file truncated or ffprobe missing")
-        finish(dur)
-        return
-    check("ffprobe parses the file", True)
-    fmt = probe.get("format", {})
-    vstreams = [s for s in probe.get("streams", []) if s.get("codec_type") == "video"]
-    check("has a video stream", len(vstreams) == 1, f"{len(vstreams)} video stream(s)")
-    if vstreams:
-        vs = vstreams[0]
+    fmt, vstreams, vs = {}, [], None
+    if video_ok:
+        if probe is None:
+            check("ffprobe parses the file", False, "file truncated or ffprobe missing")
+        else:
+            check("ffprobe parses the file", True)
+            fmt = probe.get("format", {})
+            vstreams = [s for s in probe.get("streams", []) if s.get("codec_type") == "video"]
+            check("has a video stream", len(vstreams) == 1, f"{len(vstreams)} video stream(s)")
+            vs = vstreams[0] if vstreams else None
+    if vs:
         fps_num, fps_den = (vs.get("avg_frame_rate") or "0/1").split("/")
         fps = float(fps_num) / max(1e-9, float(fps_den))
         check("resolution plausible (landscape camera image)",
@@ -123,10 +134,102 @@ def main():
             check("not truncated (duration in range 5 s - 1 h)", 5 <= fmt_dur <= 3600,
                   f"{fmt_dur:.1f}s")
     # list all streams (e.g. the custom pose track, if the demuxer sees it)
-    for s in probe.get("streams", []):
+    for s in (probe or {}).get("streams", []):
         if s.get("codec_type") != "video":
             note(f"stream: {s.get('codec_type')} {s.get('codec_name')} "
                  f"({s.get('tags', {}).get('language', '?')})")
+
+    # ------------------------------------------------------------------
+    print("\nframes.json (P2a: source→encoded map + PTS round-trip)")
+    frames_p = session_dir / "video" / "frames.json"
+    if not frames_p.is_file():
+        legacy = session_dir / "frames.json"
+        frames_p = legacy if legacy.is_file() else frames_p
+    frames = load_json(frames_p) if frames_p.is_file() else None
+    if frames is None:
+        check("video/frames.json exists", False)
+    else:
+        check("video/frames.json exists", True, f"{len(frames.get('frames', []))} frame records")
+        check("schema", frames.get("schema") == "bildfang-capture/v1-frames",
+              str(frames.get("schema")))
+        tb = frames.get("video_timebase", {})
+        origin = tb.get("origin_raw_ns", 0)
+        check("video_timebase source_clock is android_camera", tb.get("source_clock") == "android_camera")
+        check("video_timebase origin persisted (>0)", isinstance(origin, int) and origin > 0,
+              str(origin))
+        cnt = frames.get("counters", {})
+        obs, sub, enc, mux, drp = (cnt.get("camera_frames_observed", 0),
+                                   cnt.get("frames_submitted", 0),
+                                   cnt.get("frames_encoded", 0),
+                                   cnt.get("frames_muxed", 0),
+                                   cnt.get("frames_dropped", 0))
+        check("counter invariant: observed == submitted + dropped",
+              obs == sub + drp, f"{obs} = {sub} + {drp}")
+        check("no silent frame drops (dropped == 0)", drp == 0, str(drp))
+        check("encoded == muxed", enc == mux, f"{enc} / {mux}")
+        if video_ok:
+            check("video has >= 1 muxed frame", mux >= 1, str(mux))
+        else:
+            check("no video file => nothing muxed", mux == 0, str(mux))
+
+        fr = frames.get("frames", [])
+        if fr:
+            pts = [f["pts_ns"] for f in fr]
+            camt = [f.get("android_camera_timestamp_ns", 0) for f in fr]
+            arct = [f.get("arcore_frame_timestamp_raw_ns", 0) for f in fr]
+            check("pts_ns monotonic (non-decreasing)", monotonous(pts))
+            check("camera timestamps monotonic", monotonous(camt) and all(t > 0 for t in camt))
+            check("arcore raw timestamps monotonic", monotonous(arct) and all(t > 0 for t in arct))
+            if origin > 0:
+                rederived = [c - origin for c in camt]
+                exact = sum(1 for a, b in zip(pts, rederived) if a == b)
+                check("pts_ns == camera_ts - origin for every frame (reversible)",
+                      exact == len(fr), f"{exact}/{len(fr)} exact")
+            gaps = [b - a for a, b in zip(pts, pts[1:])]
+            if gaps:
+                gmed = sorted(gaps)[len(gaps) // 2]
+                gm = sum(gaps) / len(gaps)
+                gmax = max(gaps)
+                drops_est = sum(1 for g in gaps if g > 1.5 * gmed)
+                note(f"PTS gaps: median {gmed/1e6:.3f} ms, mean {gm/1e6:.3f} ms, "
+                     f"max {gmax/1e6:.3f} ms, >1.5x-median gaps: {drops_est}")
+                check("no large PTS gaps (> 3x median)",
+                      all(g <= 3 * gmed for g in gaps),
+                      f"max {gmax/1e6:.2f} ms vs median {gmed/1e6:.2f} ms")
+            with_pose = sum(1 for f in fr if f.get("pose_index") is not None)
+            check("pose_index coverage (>= 90%)", with_pose >= 0.9 * len(fr),
+                  f"{with_pose}/{len(fr)} ({100*with_pose/len(fr):.0f}%)")
+
+            # --- the P2a round-trip: app-level PTS vs MP4 container PTS ---
+            mp4_pts = get_pts_ns(video_p, vs) if vs else []
+            if mp4_pts:
+                n = min(len(pts), len(mp4_pts))
+                diff = [(mp4_pts[i] - pts[i]) for i in range(n)]
+                adiff = sorted(abs(d) for d in diff)
+                p50 = adiff[len(adiff) // 2] / 1000.0
+                p95 = adiff[min(len(adiff) - 1, int(0.95 * len(adiff)))] / 1000.0
+                amax = adiff[-1] / 1000.0
+                tbstr = vs.get("time_base", "?")
+                print("\nPTS round-trip (frames.json pts_ns vs MP4 decoded PTS)")
+                print(f"  aligned samples: {n} (app {len(pts)} / container {len(mp4_pts)})")
+                print(f"  |residual| us:  p50 {p50:.1f}   p95 {p95:.1f}   max {amax:.1f}")
+                print(f"  container time_base: {tbstr}")
+                if tbstr != "?":
+                    denom = int(tbstr.split("/")[-1]) if "/" in tbstr else 1
+                    quant_us = 1e6 / denom
+                    check("max PTS residual within one container timebase quantum",
+                          amax <= quant_us + 1, f"max {amax:.1f} us vs quantum {quant_us:.1f} us")
+                    check("p95 PTS residual < 50 us (sub-frame)", p95 < 50, f"{p95:.1f} us")
+                check("no negative residuals (container never before app)",
+                      min(diff) >= 0, f"min {min(diff)/1000:.1f} us")
+
+    # ------------------------------------------------------------------
+    disc_p = session_dir / "poses" / "discontinuities.json"
+    if disc_p.is_file():
+        disc = load_json(disc_p)
+        evs = disc.get("events", [])
+        note(f"discontinuities.json: {len(evs)} informational event(s) "
+             f"({', '.join(sorted({e.get('kind', '?') for e in evs})) or 'none'})")
 
     # ------------------------------------------------------------------
     print("\nposes")
@@ -190,7 +293,7 @@ def main():
              f"y {extent[1]:.2f} m, z {extent[2]:.2f} m")
 
     # clock relationships — report, don't assert (P3)
-    if probe and vstreams and all(t > 0 for t in cam_ts):
+    if probe and vs and all(t > 0 for t in cam_ts):
         pts = get_pts_ns(video_p, vs)
         if pts:
             lo, hi = min(pts), max(pts)
