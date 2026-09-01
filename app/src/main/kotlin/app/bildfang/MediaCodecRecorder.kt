@@ -1,6 +1,7 @@
 package app.bildfang
 
 import android.media.MediaCodec
+import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.os.Handler
@@ -51,8 +52,9 @@ class MediaCodecRecorder(
     override var timebaseOriginNs: Long = 0L
         private set
 
-    val encoderSurface: Surface
-    val codec: MediaCodec
+    /** Set in start(); read by the GL feed after start() returned true. */
+    lateinit var encoderSurface: Surface
+    lateinit var codec: MediaCodec
     var lastFrameIndex: Int = -1
         private set
 
@@ -70,13 +72,6 @@ class MediaCodecRecorder(
 
     init {
         outputDir.mkdirs()
-        val fmt = MediaFormat.createVideoFormat("video/avc", width, height)
-        fmt.setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
-        fmt.setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-        fmt.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1) // ~1 s GOP
-        codec = MediaCodec.createEncoderByType(MIME_AVC)
-        codec.configure(fmt, null, null, 0)
-        encoderSurface = codec.createInputSurface()
     }
 
     /**
@@ -100,6 +95,84 @@ class MediaCodecRecorder(
                 frames.clear()
                 lastFrameIndex = -1
             }
+            // Codec creation: enumerate what the platform actually exposes
+            // (C2 list; hardware first, software as fallback), and walk a
+            // bitrate ladder per codec — C2 encoders reject out-of-range
+            // bitrates with an exception that carries no message, and
+            // some OS builds expose no usable hardware video encoder at
+            // all (observed on GrapheneOS 17 — see P2a status).
+            val c2 = MediaCodecList(0)
+            val all = c2.codecInfos
+            val avcEncoders = all
+                .filter { it.isEncoder && it.supportedTypes.contains(MIME_AVC) }
+            val ordered = avcEncoders.filter { it.isHardwareAccelerated } +
+                avcEncoders.filter { !it.isHardwareAccelerated }
+            android.util.Log.i("bildfang", "AVC encoder candidates: " +
+                ordered.joinToString { "${it.name}(${if (it.isHardwareAccelerated) "HW" else "SW"})" })
+            val ladder = listOf(bitrate, 12_000_000, 6_000_000)
+            var lastErr: Exception? = null
+            var lastErrStage = ""
+            var ok = false
+            outer@ for (ci in ordered) {
+                for (br in ladder) {
+                    var c: MediaCodec? = null
+                    try {
+                        c = MediaCodec.createEncoderByType(ci.name) // stage A
+                        android.util.Log.i("bildfang", "stageA ok: ${ci.name}")
+                        val fmt = MediaFormat.createVideoFormat(MIME_AVC, width, height)
+                        fmt.setInteger(MediaFormat.KEY_BIT_RATE, br)
+                        fmt.setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+                        fmt.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1) // ~1 s GOP
+                        c.configure(fmt, null, null, 0) // stage B
+                        android.util.Log.i("bildfang", "stageB ok: ${ci.name} ${width}x$height br=$br")
+                        codec = c
+                        encoderSurface = c.createInputSurface() // stage C
+                        android.util.Log.i("bildfang", "encoder ready: ${ci.name} bitrate=${br} fps=$fps ${width}x$height output=${c.outputFormat}")
+                        lastErr = null
+                        lastErrStage = ""
+                        ok = true
+                        break@outer
+                    } catch (e: Exception) {
+                        lastErr = e
+                        lastErrStage = when (e) {
+                            is java.lang.IllegalArgumentException -> "B-configure"
+                            is MediaCodec.CodecException -> if (c == null) "A-create" else "B/C-configure-or-surface"
+                            else -> "A-create"
+                        }
+                        android.util.Log.w("bildfang", "attempt failed (${ci.name}, br=$br) stage=${lastErrStage}", e)
+                        try { c?.release() } catch (_: Exception) {}
+                    }
+                }
+            }
+            if (!ok) {
+                val anyVideoEnc = all.filter { it.isEncoder && it.supportedTypes.any { t -> t.startsWith("video/") } }
+                android.util.Log.e("bildfang", "no usable AVC encoder. last stage=${lastErrStage}. all video encoders: " +
+                    anyVideoEnc.joinToString { it.name })
+                // minimal-format probe: does ANY encoder accept configure
+                // with just a mime type? (isolates parameter rejection
+                // from instantiation lockdown)
+                for (probe in ordered) {
+                    var pc: MediaCodec? = null
+                    try {
+                        pc = MediaCodec.createEncoderByType(probe.name)
+                        pc!!.configure(MediaFormat.createVideoFormat(MIME_AVC, 640, 480), null, null, 0)
+                        android.util.Log.e("bildfang", "minimal configure OK on ${probe.name} — failure is parameter-specific")
+                        pc.release()
+                    } catch (e: Exception) {
+                        android.util.Log.e("bildfang", "minimal configure failed on ${probe.name}: ${e.javaClass.simpleName}")
+                        try { pc?.release() } catch (_: Exception) {}
+                    }
+                }
+                try {
+                    val d = MediaCodec.createDecoderByType(MIME_AVC)
+                    android.util.Log.i("bildfang", "AVC decoder instantiated: ${d.name}")
+                    d.release()
+                } catch (e: Exception) {
+                    android.util.Log.e("bildfang", "AVC decoder also fails", e)
+                }
+                throw lastErr ?: IllegalStateException("no usable AVC encoder")
+            }
+
             muxer = MediaMuxer(tmpFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
             codec.start()
             muxerTrack = muxer!!.addTrack(codec.outputFormat)
@@ -111,7 +184,8 @@ class MediaCodecRecorder(
             running.set(true)
             return true
         } catch (e: Exception) {
-            startFailed = e.javaClass.simpleName + ": " + e.message
+            startFailed = e.javaClass.simpleName + ": " + (e.message ?: "no message")
+            android.util.Log.e("bildfang", "recorder start failed", e)
             safeRelease()
             return false
         }
@@ -250,9 +324,13 @@ class MediaCodecRecorder(
     }
 
     private fun safeRelease() {
-        try { codec.stop() } catch (_: Exception) {}
-        try { codec.release() } catch (_: Exception) {}
-        try { encoderSurface.release() } catch (_: Exception) {}
+        if (this::codec.isInitialized) {
+            try { codec.stop() } catch (_: Exception) {}
+            try { codec.release() } catch (_: Exception) {}
+        }
+        if (this::encoderSurface.isInitialized) {
+            try { encoderSurface.release() } catch (_: Exception) {}
+        }
         drainThread?.let {
             try { it.quitSafely() } catch (_: Exception) {}
             try { it.join(1000) } catch (_: Exception) {}
