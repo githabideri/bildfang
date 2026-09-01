@@ -30,26 +30,66 @@ where reasonable. CSV: LF line endings, CRLF-free.
 
 ---
 
-## The clocks (critical)
+## The clocks — named domains, not one clock
 
-**Verified on-device (ARCore 1.54, Pixel 7, 2026-09-01):** `Frame.getTimestamp()` is **not** on `SystemClock.elapsedRealtimeNanos()` — it is a large fixed-epoch value (≈1.78×10¹⁸ ns, likely unix nanoseconds) on its own internal clock. bildfang therefore does **not** assume any shared epoch.
+**Do not assume any two clock domains are identical.** Every timestamp in
+a bildfang capture belongs to exactly one *named clock domain*; the
+relationship between domains is either **guaranteed by API contract**,
+**measured** (documented with the residual), or **unknown** (treated as
+opaque, raw value preserved).
 
-All bildfang frame clocks are **session-relative**: `frame.timestamp - anchor`, where the anchor is the timestamp of the first frame delivered to the app. `session.json` stores the anchor triple for absolute reconstruction:
+| Domain name | Source | Status of epoch |
+|-------------|--------|-----------------|
+| `arcore_frame` | `Frame.getTimestamp()` | **Unknown/opaque.** ARCore documents no epoch. On ARCore 1.54 / Pixel 7 (2026-09-01) it is observed to be a fixed, monotonic value around ≈1.78×10¹⁸ ns — an observation, not a contract; do not code against it. |
+| `android_camera` | `Frame.getAndroidCameraTimestamp()` | HAL camera clock (the timestamp the camera HAL attaches to each image). Its relation to the encoded video PTS is **measured in P1/P2** (ffprobe PTS + ARCore playback TrackData timestamps) and documented with a residual before any invariant is claimed. |
+| `android_monotonic` | `SystemClock.elapsedRealtimeNanos()` (also `SensorEvent.timestamp`) | Monotonic since boot, pauses on device sleep. Shared by the IMU samples and by bildfang's own sampling; **not** shared with `arcore_frame`. |
+| `wall_clock` | `System.currentTimeMillis()` / ISO 8601 UTC | Human provenance only (session start/end, `created_utc`). |
+| `sensor` | `SensorEvent.timestamp` | On Android this *is* `android_monotonic`; listed separately so a future platform change is a schema note, not a silent break. |
+| `container_pts` | MP4 presentation timestamps | Whatever clock the muxer was fed (for ARCore-native recordings: derived from the camera image timestamps — to be verified in P1/P2). |
+
+**What bildfang stores:** raw values in each domain are always preserved
+(`frame.timestamp` raw, `Frame.getAndroidCameraTimestamp()`,
+`SensorEvent.timestamp`, wall-clock anchors). Session-relative values are
+*derived* conveniences computed from a documented anchor, never a
+replacement of the raw values.
+
+The anchor is the first frame delivered to the app; `session.json` stores
+the triple that pins the domains at one instant:
 
 ```json
 "clock": {
-  "frame_timestamp_ns": "ARCore frame clock, epoch unknown (fixed, likely unix ns)",
-  "anchor_frame_ts": 1780000000000000000,
-  "anchor_unix_ms":  1788212345678,
-  "anchor_monotonic_ns": 4321000000000
+  "anchor_frame_ts":     1780000000000000000,  // arcore_frame  (raw, epoch unknown)
+  "anchor_unix_ms":      1788212345678,        // wall_clock
+  "anchor_monotonic_ns": 4321000000000         // android_monotonic
 }
 ```
 
-- `anchor_unix_ms` / `anchor_monotonic_ns` are read from `System.currentTimeMillis()` / `SystemClock.elapsedRealtimeNanos()` at the instant of the first frame, so any absolute epoch can be derived offline.
-- Every pose additionally carries `android_camera_timestamp_ns` (`Frame.getAndroidCameraTimestamp()`) — the **HAL camera clock**, which is the clock the video encoder uses for presentation timestamps. This is the field that aligns poses to video PTS; the ARCore frame timestamp aligns poses to each other.
-- Wall-clock time appears in `session.json` (`created_utc`, ISO 8601 UTC) only as a reference.
+so any consumer can derive `frame_ts = anchor_frame_ts + (t_relative)` and
+cross to the other domains through the same anchor — without ever assuming
+the domains are equal.
 
-> The Phase-0 ideal (one shared `elapsedRealtimeNanos` clock across all files, `manifest.json` with sha256 hashes, separate `imu.csv` / `frames.json` / `intrinsics.json`) remains the target for later versions. The current app (v0.2.0) writes `session.json` + `poses/poses.json` + `video.mp4` (ARCore-native MP4, which already embeds the IMU and a custom JSON pose track in the container itself).
+**Guaranteed / measured / unknown:**
+
+- **Guaranteed** (API contract): ordering of frames and of poses; a pose
+  and an embedded custom-track record written to the same `Frame` belong
+  to the same camera frame; units are as documented; each field's domain
+  is as tabled above.
+- **Measured** (pending, P1/P2): the transformation between
+  `android_camera` and `container_pts` for the ARCore-native MP4 —
+  expected to be identity or a constant offset; the residual is recorded
+  when measured.
+- **Unknown/opaque**: the epoch of `arcore_frame`. Never asserted, never
+  transformed away — the raw value is always stored alongside the derived
+  one.
+
+> The Phase-0 ideal (one shared `elapsedRealtimeNanos` clock across all
+> files, `manifest.json` with sha256 hashes, separate `imu.csv` /
+> `frames.json` / `intrinsics.json`) remains the target for later versions
+> — as a *derived, clearly-labeled* convenience on top of the raw domain
+> values, not as a claim about the sources. The current app (v0.2.x)
+> writes `session.json` + `poses/poses.json` + `video.mp4` (ARCore-native
+> MP4, which embeds the IMU and a custom JSON pose track in the container
+> itself).
 
 ## `manifest.json`
 
@@ -182,8 +222,11 @@ timestamp_ns,ax,ay,az,gx,gy,gz
 - Rows come from `SensorManager` (`TYPE_ACCELEROMETER`,
   `TYPE_GYROSCOPE`), sampled at `SENSOR_DELAY_GAME` (≈50 Hz; raised to
   `SENSOR_DELAY_FASTEST` in a later version if the device allows).
-- `timestamp_ns` = `SensorEvent.timestamp` — **the same monotonic clock**
-  as everything else.
+- `timestamp_ns` = `SensorEvent.timestamp` — domain `android_monotonic`
+  (on Android, `SensorEvent.timestamp` is `elapsedRealtimeNanos`). This is
+  a *different* domain than the ARCore frame clock; the two are
+  reconciled offline through the session anchor, never by assuming
+  equality.
 - Acceleration in m/s² (gravity included), angular velocity in rad/s.
 - If one sensor is missing on a device, the affected columns are empty
   (`4321…,0.02,9.81,-0.11,,,,`).
@@ -196,8 +239,7 @@ timestamp_ns,ax,ay,az,gx,gy,gz
 - `camera.mp4` — H.264 (or the device's best practically-encodable codec),
   highest quality the device allows at a stable frame rate (v0.1 target:
   30 fps; 4K if the device sustains it, otherwise 1080p).
-- `frames.json` (Phase 2) — maps each encoded video frame to the monotonic
-  clock:
+- `frames.json` (Phase 2) — maps each encoded video frame to its presentation timestamp
 
   ```json
   {
@@ -206,6 +248,7 @@ timestamp_ns,ax,ay,az,gx,gy,gz
     "codec": "h264",
     "resolution": [3840, 2160],
     "fps_nominal": 30,
+    "pts_domain": "container_pts (source domain verified in P1/P2)",
     "frames": [
       { "idx": 0, "presentation_ns": 4321002000000 },
       { "idx": 1, "presentation_ns": 4321033300000 }
@@ -214,8 +257,8 @@ timestamp_ns,ax,ay,az,gx,gy,gz
   ```
 
   Presentation timestamps are written explicitly to the muxer (no
-  free-running encoder clock), so video ↔ pose ↔ IMU alignment is exact by
-  construction, not estimated.
+  free-running encoder clock), so video ↔ pose ↔ IMU alignment is derived from the measured domain relationships
+  above, not estimated per frame.
 
 ## `metadata/device.json`
 
@@ -250,18 +293,24 @@ kept at model level (the capture stays portable and non-identifying).
 
 ## Interruptions & invariants
 
-- **Device sleep:** if the device suspends mid-capture, the monotonic clock
-  stops. The app marks the gap in `manifest.json` (`interruptions: [{
+- **Device sleep:** if the device suspends mid-capture, `android_monotonic`
+  (and the sensor timestamps on it) stops, while `wall_clock` continues.
+  The app marks the gap in `manifest.json` (`interruptions: [{
   "from_ns": …, "to_ns": …, "reason": "sleep" }]`) and continues poses in
   the same segment (no world reset). Consumers must not assume
-  `t(n+1) - t(n)` is bounded.
+  `t(n+1) - t(n)` is bounded in any domain.
 - **Stop** writes files in this order: imu → poses → frames/video-index →
   intrinsics → device → manifest (manifest last = completeness marker).
 - **Invariants consumers may rely on:**
-  1. all `*_ns` fields share one monotonic clock;
-  2. pose timestamps are non-decreasing within a segment;
-  3. every ARCore `TRACKING` frame of the session has a pose entry;
-  4. the manifest lists every file with size + sha256.
+  1. every `*_ns` field belongs to the named domain documented for it
+     (see "The clocks"); no field is implicitly shared across domains;
+  2. timestamps are non-decreasing within a segment, per domain;
+  3. every ARCore `TRACKING` frame of the session has a pose entry, and a
+     pose and an embedded track record written to the same `Frame`
+     describe the same camera frame;
+  4. raw domain values are always stored next to derived session-relative
+     values; derived values are computed only from documented anchors;
+  5. the manifest lists every file with size + sha256.
 
 ## Versioning
 

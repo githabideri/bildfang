@@ -31,6 +31,7 @@ import java.util.UUID
 import javax.microedition.khronos.opengles.GL10
 import kotlin.concurrent.Volatile
 import kotlin.math.max
+import kotlin.math.sqrt
 
 /**
  * Phase-2 UI + capture loop.
@@ -87,7 +88,8 @@ class MainActivity : Activity() {
     private val poses = ArrayList<PoseRecord>()
     private val posesLock = Any()
     private var segment = 0
-    private var lastTracking: PoseRecord? = null
+    private var lastPose: PoseRecord? = null
+    private val discontinuities = ArrayList<DiscontinuityEvent>()
     private var fps = 0f
 
     private var lastMetricsNs = 0L
@@ -126,6 +128,7 @@ class MainActivity : Activity() {
     private val quadBufferId = IntArray(1) // glGenBuffers in onSurfaceCreated
     private var oesTextureId = 0
     private var lastLoggedCtn = -1
+    private var trackDataWarned = false
     // Canonical ARCore/BackgroundRenderer quad order for GL_TRIANGLE_STRIP:
     // BL, BR, TL, TR (NDC). Texture UVs start as a plain Y-flip and are
     // replaced by transformCoordinates2d once display geometry is valid.
@@ -569,7 +572,8 @@ class MainActivity : Activity() {
         synchronized(posesLock) {
             poses.clear()
             segment = 0
-            lastTracking = null
+            lastPose = null
+            discontinuities.clear()
         }
 
         val cfg = RecordingConfig(s)
@@ -580,10 +584,18 @@ class MainActivity : Activity() {
                     .setId(trackUuid)
                     .setMimeType("application/json")
                     .setMetadata(
-                        ByteBuffer.wrap(
-                            "\"bildfang-capture/v1 pose track: one compact JSON pose per video frame\""
-                                .encodeToByteArray()
-                        )
+                        // Native byte order, like the VBO: ARCore hands this
+                        // buffer to its native layer.
+                        ByteBuffer.allocateDirect(
+                            "bildfang-capture/v1 pose track: one compact JSON pose per video frame"
+                                .encodeToByteArray().size
+                        ).apply {
+                            order(ByteOrder.nativeOrder())
+                            put(
+                                "bildfang-capture/v1 pose track: one compact JSON pose per video frame"
+                                    .encodeToByteArray()
+                            )
+                        }
                     )
             )
         try {
@@ -593,7 +605,8 @@ class MainActivity : Activity() {
             stopBtn.isEnabled = true
             statusView.setText(R.string.status_recording)
         } catch (e: Exception) {
-            statusView.text = "Recording failed: ${e.message}"
+            android.util.Log.e("bildfang", "startRecording failed", e)
+            statusView.text = "Recording failed: ${e.javaClass.simpleName}: ${e.message ?: e}"
             startBtn.isEnabled = true
         }
     }
@@ -612,6 +625,7 @@ class MainActivity : Activity() {
         stopBtn.isEnabled = false
 
         val snapshot = synchronized(posesLock) { poses.toList() }
+        val discSnapshot = synchronized(posesLock) { discontinuities.toList() }
         val dir = sessionDir
         if (snapshot.isEmpty() || dir == null) {
             statusView.text = if (snapshot.isEmpty())
@@ -624,6 +638,8 @@ class MainActivity : Activity() {
         try {
             val poseFile = File(dir, "poses/poses.json").apply { parentFile?.mkdirs() }
             poseFile.writeText(PoseJson.build(snapshot))
+            File(dir, "poses/discontinuities.json")
+                .writeText(DiscontinuityJson.build(discSnapshot))
             File(dir, "session.json").writeText(buildSessionJson())
             statusView.text = "Saved · ${snapshot.size} poses · video + pose track"
         } catch (e: Exception) {
@@ -660,6 +676,7 @@ class MainActivity : Activity() {
                 "alignment": "one record per video frame; PTS shared with the video track"
               },
               "poses_file": "poses/poses.json",
+              "discontinuities_file": "poses/discontinuities.json",
               "clock": {
                 "frame_timestamp_ns": "ARCore frame clock, epoch unknown (fixed, likely unix ns)",
                 "anchor_frame_ts": $frameTsAnchor,
@@ -696,31 +713,53 @@ class MainActivity : Activity() {
         if (recording) {
             val frameTs = frame.timestamp - frameTsAnchor // session-relative ns
             synchronized(posesLock) {
-                // World-frame reset heuristic: a large jump between
-                // consecutive TRACKING frames means ARCore re-initialized
-                // the world frame.
-                val prev = lastTracking
-                if (state == "TRACKING" && prev != null) {
+                // Trajectory discontinuity detection (P5): multiple
+                // independent signals; the result is an *informational*
+                // event, never a verdict — downstream decides whether it
+                // means a world-frame reset, relocalization, a bad pose, or
+                // legitimate fast motion. Only a translation jump bumps the
+                // segment (the actual coordinate-frame change).
+                val prev = lastPose
+                if (prev != null && state == "TRACKING") {
+                    val dtMs = (frameTs - prev.timestampNs) / 1_000_000f
                     val dx = t[0] - prev.x
                     val dy = t[1] - prev.y
                     val dz = t[2] - prev.z
-                    if (frameTs - prev.timestampNs < 1_000_000_000L &&
-                        (dx * dx + dy * dy + dz * dz) > 4.0f // 2 m jump in < 1 s
-                    ) {
-                        segment++
+                    val jumpM = sqrt(dx * dx + dy * dy + dz * dz)
+                    val rotDeg = quaternionAngleDeg(
+                        prev.qx, prev.qy, prev.qz, prev.qw, q[0], q[1], q[2], q[3]
+                    )
+                    val reasons = ArrayList<String>()
+                    if (prev.trackingState != "TRACKING") {
+                        reasons.add("tracking_recovered")
+                    }
+                    if (prev.trackingState == "TRACKING" && dtMs in 0f..1000f) {
+                        if (jumpM > 2.0f) reasons.add("translation_jump") // >2 m in <1 s
+                        if (rotDeg > 45f) reasons.add("rotation_jump")     // >45° in <1 s
+                    }
+                    if (reasons.isNotEmpty()) {
+                        discontinuities.add(DiscontinuityEvent(
+                            frame = poses.size,
+                            reasons = reasons,
+                            translationJumpM = jumpM,
+                            rotationJumpDeg = rotDeg,
+                            dtMs = dtMs
+                        ))
+                        if (reasons.contains("translation_jump")) segment++
                     }
                 }
                 val r = PoseRecord(
                     index = poses.size,
                     timestampNs = frameTs,
                     androidCameraTimestampNs = frame.androidCameraTimestamp,
+                    frameTsRawNs = frame.timestamp,
                     x = t[0], y = t[1], z = t[2],
                     qx = q[0], qy = q[1], qz = q[2], qw = q[3],
                     trackingState = state,
                     segment = segment,
                 )
                 poses.add(r)
-                if (state == "TRACKING") lastTracking = r
+                lastPose = r
             }
 
             // Pose into the recording: one compact JSON record per frame,
@@ -733,6 +772,10 @@ class MainActivity : Activity() {
                 frame.recordTrackData(trackUuid, ByteBuffer.wrap(json.encodeToByteArray()))
             } catch (e: Exception) {
                 // non-fatal: poses.json is the canonical export
+                if (!trackDataWarned) {
+                    trackDataWarned = true
+                    android.util.Log.w("bildfang", "recordTrackData (first failure only)", e)
+                }
             }
         }
 

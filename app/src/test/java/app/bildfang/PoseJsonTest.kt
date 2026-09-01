@@ -79,4 +79,44 @@ class PoseJsonTest {
         assertEquals(true, json.contains("\"poses\": ["))
         assertEquals(1, json.split("\"i\": ").size - 1)
     }
+
+    @Test
+    fun `raw arcore frame timestamp is emitted when present and omitted when zero`() {
+        val withRaw = pose(0, 1000, 0f, 0f, 0f).copy(frameTsRawNs = 1780000000000000000L)
+        val withoutRaw = pose(0, 1000, 0f, 0f, 0f) // default 0L
+        assertTrue(PoseJson.build(listOf(withRaw)).contains("\"frame_timestamp_raw_ns\": 1780000000000000000"))
+        assertTrue(!PoseJson.build(listOf(withoutRaw)).contains("\"frame_timestamp_raw_ns\":"))
+    }
+
+    @Test
+    fun `discontinuity events serialize with all signals`() {
+        val json = DiscontinuityJson.build(
+            listOf(
+                DiscontinuityEvent(frame = 7, reasons = listOf("tracking_recovered", "translation_jump"),
+                    translationJumpM = 2.3f, rotationJumpDeg = 5.0f, dtMs = 40f),
+                DiscontinuityEvent(frame = 31, reasons = listOf("rotation_jump"),
+                    translationJumpM = 0.05f, rotationJumpDeg = 62f, dtMs = 33f),
+            )
+        )
+        assertEquals(true, json.contains("\"schema\": \"bildfang-capture/v1-discontinuities\""))
+        assertEquals(true, json.contains("\"tracking_recovered\", \"translation_jump\""))
+        assertEquals(true, json.contains("\"i\": 31"))
+        assertEquals(true, json.contains("\"rotation_jump_deg\": 62.000"))
+        assertEquals(2, json.split("\"i\": ").size - 1)
+    }
+
+    @Test
+    fun `empty discontinuities list serializes as empty array`() {
+        val json = DiscontinuityJson.build(emptyList())
+        assertEquals(true, json.contains("\"events\": []"))
+    }
+
+    @Test
+    fun `quaternion angle identity is zero and 90 degree rotation about z is 90`() {
+        assertEquals(0f, quaternionAngleDeg(0f, 0f, 0f, 1f, 0f, 0f, 0f, 1f), 0.001f)
+        val r90 = (1f / Math.sqrt(2.0)).toFloat()
+        assertEquals(90f, quaternionAngleDeg(0f, 0f, 0f, 1f, 0f, 0f, r90, r90), 0.01f)
+        // double-cover: -q represents the same rotation
+        assertEquals(0f, quaternionAngleDeg(0f, 0f, 0f, 1f, 0f, 0f, 0f, -1f), 0.01f)
+    }
 }
