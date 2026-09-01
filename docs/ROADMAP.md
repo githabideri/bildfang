@@ -36,7 +36,7 @@ filter, discard, or silently alter the preserved raw capture.
 |-------|-------|--------|-------|
 | P0 | Freeze preview baseline | **DONE** | `8674383` verified on Pixel 7 / GrapheneOS 17 / ARCore 1.54 (2026-09-01) |
 | P1 | First real end-to-end capture | **IN PROGRESS — MediaCodec path** | ARCore native recorder dead on Pixel 7 (device bug, bisection below); per 2026-09-01 decision MediaCodec self-encode is the primary path, native recording is capability-dependent only. Acceptance criteria below. |
-| P2a | MediaCodec timestamp/mux round-trip | **IN PROGRESS (required)** | camera ts → normalized PTS → encoder PTS → MP4 PTS → ffprobe; quantify residual. Unblocks P1. |
+| P2a | MediaCodec timestamp/mux round-trip | **IN PROGRESS (required)** — `MediaCodecRecorder` committed (`fcf0b74`: HW H.264 surface input, session-relative PTS via `eglPresentationTimeANDROID`, atomic `.tmp→.mp4` finalize, `frames.json`, counters); on-device round-trip pending (needs a camera-allowed device; 9 Pro camera is policy-disabled, Pixel 7 port pending) | camera ts → normalized PTS → encoder PTS → MP4 PTS → ffprobe; quantify residual. Unblocks P1. |
 | P2b | ARCore native custom-track playback round-trip | **dead end on this fleet (2026-09-01)** | both Pixels: ARCore 1.54 native recorder fatal; see verdict below |
 | P3 | Clock-domain model | **DONE** | `capture-format.md` rewritten: named domains (arcore_frame / android_camera / android_monotonic / wall_clock / sensor / container_pts), guaranteed/measured/unknown, no epoch claims; `frame_timestamp_raw_ns` stored per pose |
 | P4 | De-contradict capture-format.md clocks | **DONE** | same rewrite; "one shared clock" invariant removed; IMU + invariants sections aligned with the domain model |
