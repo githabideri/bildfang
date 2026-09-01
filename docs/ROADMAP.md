@@ -36,7 +36,7 @@ filter, discard, or silently alter the preserved raw capture.
 |-------|-------|--------|-------|
 | P0 | Freeze preview baseline | **DONE** | `8674383` verified on Pixel 7 / GrapheneOS 17 / ARCore 1.54 (2026-09-01) |
 | P1 | First real end-to-end capture | **IN PROGRESS — MediaCodec path** | ARCore native recorder dead on Pixel 7 (device bug, bisection below); per 2026-09-01 decision MediaCodec self-encode is the primary path, native recording is capability-dependent only. Acceptance criteria below. |
-| P2a | MediaCodec timestamp/mux round-trip | **IN PROGRESS (required)** — `MediaCodecRecorder` committed (HW H.264 surface input, session-relative PTS via `eglPresentationTimeANDROID`, atomic `.tmp→.mp4` finalize, `frames.json`, counters, per-stage codec diagnostics). **9 Pro (Exynos 2400 / GrapheneOS 17): every video encoder (HW + both SW) fails `configure()` — even minimal 640×480/mime-only — while decoders work; `component store query: 6` indicates OS-level encoder-component denial.** Same wall as the ARCore native-recorder death (P1/P2b). On-device round-trip pending on **Pixel 7** (Tensor G2; block may be 9 Pro/build-specific) | camera ts → normalized PTS → encoder PTS → MP4 PTS → ffprobe; quantify residual. Unblocks P1. |
+| P2a | MediaCodec timestamp/mux round-trip | **IN PROGRESS (required)** — `MediaCodecRecorder` committed (HW H.264 surface input, session-relative PTS via `eglPresentationTimeANDROID`, atomic `.tmp→.mp4` finalize, `frames.json`, counters, per-stage codec diagnostics). **2026-09-01: the "GrapheneOS encoder lockdown" diagnosis is REJECTED** (ChatGPT review + counter-evidence: stock camera records video on *both* fleet devices on these exact builds). Root cause was three MediaCodec API bugs in our recorder: `configure(..., 0)` missing `CONFIGURE_FLAG_ENCODE` (documented `IllegalArgumentException` cause), `createEncoderByType()` called with a codec *name* instead of a MIME type (needs `createByCodecName()`), and no explicit `COLOR_FormatSurface`. The earlier "minimal 640×480/mime-only probe" was an invalid test (no flag, no color format, no bitrate) and the `component store query: 6` log line is not evidence of a denial (it appears in normal Exynos codec activity). Recorder is fixed (encode flag, `createByCodecName`, explicit surface color format, muxer started at `INFO_OUTPUT_FORMAT_CHANGED` per the canonical state machine) — on-device re-test pending: 10s probe on the 9 Pro, then the Pixel 7, then P1. The ARCore *native* recorder deaths (P1/P2b) remain real, observed failures — now classified as an unresolved ARCore/GrapheneOS interaction, **not** as proof of a general encoder block. | camera ts → normalized PTS → encoder PTS → MP4 PTS → ffprobe; quantify residual. Unblocks P1. |
 | P2b | ARCore native custom-track playback round-trip | **dead end on this fleet (2026-09-01)** | both Pixels: ARCore 1.54 native recorder fatal; see verdict below |
 | P3 | Clock-domain model | **DONE** | `capture-format.md` rewritten: named domains (arcore_frame / android_camera / android_monotonic / wall_clock / sensor / container_pts), guaranteed/measured/unknown, no epoch claims; `frame_timestamp_raw_ns` stored per pose |
 | P4 | De-contradict capture-format.md clocks | **DONE** | same rewrite; "one shared clock" invariant removed; IMU + invariants sections aligned with the domain model |
@@ -395,8 +395,14 @@ works**.
 | Pixel 9 Pro (Tensor G4) / GrapheneOS 17 | **yes** (Play Store offered it; `checkAvailability()` → ARCore ready) | **35 fps, TRACKING** | **fatal** — same signature (`recorder_util.cc:68` hinge-angle info line, then `FatalException` 3 ms later, no files; tested 15:09 UTC with a bare `RecordingConfig`, no custom track, active tracking) |
 
 Two different SoCs, same OS, identical failure inside ARCore's recorder
-initialization — this points at **GrapheneOS** (seccomp/SELinux policy on
-the recorder's native path) rather than hardware. Per the 2026-09-01
+initialization. (Amended 2026-09-01 after ChatGPT review: the earlier
+reading — "GrapheneOS blocks video encoder components" — is **rejected**:
+the stock camera records video on both devices on these exact builds, so
+general encoder availability is not the issue.) The native recorder's
+death is an unresolved **ARCore/GrapheneOS interaction** (its own native
+encoder path, `recorder_util.cc`, dying before any frame — possibly a
+specific component, policy, or an ARCore bug on this OS); it no longer
+casts doubt on MediaCodec encoders in general. Per the 2026-09-01
 decision: **stop debugging the native recorder.** P2b stays in the
 documentation only — if a future GrapheneOS/ARCore release fixes it, it
 becomes a supplemental capability on supported stock-GMS devices; it
