@@ -37,7 +37,7 @@ filter, discard, or silently alter the preserved raw capture.
 | P0 | Freeze preview baseline | **DONE** | `8674383` verified on Pixel 7 / GrapheneOS 17 / ARCore 1.54 (2026-09-01) |
 | P1 | First real end-to-end capture | **IN PROGRESS — MediaCodec path** | ARCore native recorder dead on Pixel 7 (device bug, bisection below); per 2026-09-01 decision MediaCodec self-encode is the primary path, native recording is capability-dependent only. Acceptance criteria below. |
 | P2a | MediaCodec timestamp/mux round-trip | **IN PROGRESS (required)** | camera ts → normalized PTS → encoder PTS → MP4 PTS → ffprobe; quantify residual. Unblocks P1. |
-| P2b | ARCore native custom-track playback round-trip | **optional / capability-dependent** | only on devices where native recording works (Pixel 9 Pro check pending); must not block v1 |
+| P2b | ARCore native custom-track playback round-trip | **dead end on this fleet (2026-09-01)** | both Pixels: ARCore 1.54 native recorder fatal; see verdict below |
 | P3 | Clock-domain model | **DONE** | `capture-format.md` rewritten: named domains (arcore_frame / android_camera / android_monotonic / wall_clock / sensor / container_pts), guaranteed/measured/unknown, no epoch claims; `frame_timestamp_raw_ns` stored per pose |
 | P4 | De-contradict capture-format.md clocks | **DONE** | same rewrite; "one shared clock" invariant removed; IMU + invariants sections aligned with the domain model |
 | P5 | Raw poses + trajectory_discontinuity | **IN PROGRESS** | multi-signal discontinuity detection → `poses/discontinuities.json` (informational, not a verdict); `translation_raw` + explicit SE(3) segment transform deferred until after v1 live-verify (schema freeze, step 9) |
@@ -385,11 +385,23 @@ rounding). Any larger drift is a bug, not a property.
 same Frame during dataset playback, and `TrackData.getFrameTimestamp()` is
 defined to equal the recording Frame's `Frame.getTimestamp()` — the
 canonical ARCore-native synchronization test **where the native recorder
-works** (Pixel 9 Pro capability check pending; dead on Pixel 7 /
-GrapheneOS 17, see P1 status). If it works on a supported device, ARCore
-custom-track playback is valuable as a supplemental capability; it must
-**not** block Bildfang v1. Keep `poses.json` as an independent sidecar
-regardless — redundancy is intentional.
+works**.
+
+### Verdict — 2026-09-01: dead end on this fleet
+
+| Device | ARCore certified | Preview / tracking | Native recorder |
+|---|---|---|---|
+| Pixel 7 (Tensor G2) / GrapheneOS 17 | yes (Play Store) | 30 fps, TRACKING | **fatal** at `nativeStartRecording` (~2 ms) |
+| Pixel 9 Pro (Tensor G4) / GrapheneOS 17 | **yes** (Play Store offered it; `checkAvailability()` → ARCore ready) | **35 fps, TRACKING** | **fatal** — same signature (`recorder_util.cc:68` hinge-angle info line, then `FatalException` 3 ms later, no files; tested 15:09 UTC with a bare `RecordingConfig`, no custom track, active tracking) |
+
+Two different SoCs, same OS, identical failure inside ARCore's recorder
+initialization — this points at **GrapheneOS** (seccomp/SELinux policy on
+the recorder's native path) rather than hardware. Per the 2026-09-01
+decision: **stop debugging the native recorder.** P2b stays in the
+documentation only — if a future GrapheneOS/ARCore release fixes it, it
+becomes a supplemental capability on supported stock-GMS devices; it
+does not block, and does not gate, Bildfang v1. `poses.json` remains the
+independent sidecar; redundancy is intentional.
 
 ## P3 — Fix the clock model before freezing capture/v1
 
