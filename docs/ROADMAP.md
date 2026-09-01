@@ -35,8 +35,8 @@ filter, discard, or silently alter the preserved raw capture.
 | Phase | Title | Status | Notes |
 |-------|-------|--------|-------|
 | P0 | Freeze preview baseline | **DONE** | `8674383` verified on Pixel 7 / GrapheneOS 17 / ARCore 1.54 (2026-09-01) |
-| P1 | First real end-to-end capture | **IN PROGRESS — MediaCodec path** | ARCore native recorder dead on Pixel 7 (device bug, bisection below); per 2026-09-01 decision MediaCodec self-encode is the primary path, native recording is capability-dependent only. Acceptance criteria below. |
-| P2a | MediaCodec timestamp/mux round-trip | **IN PROGRESS (required)** — `MediaCodecRecorder` committed (HW H.264 surface input, session-relative PTS via `eglPresentationTimeANDROID`, atomic `.tmp→.mp4` finalize, `frames.json`, counters, per-stage codec diagnostics). **2026-09-01: the "GrapheneOS encoder lockdown" diagnosis is REJECTED** (ChatGPT review + counter-evidence: stock camera records video on *both* fleet devices on these exact builds). Root cause was three MediaCodec API bugs in our recorder: `configure(..., 0)` missing `CONFIGURE_FLAG_ENCODE` (documented `IllegalArgumentException` cause), `createEncoderByType()` called with a codec *name* instead of a MIME type (needs `createByCodecName()`), and no explicit `COLOR_FormatSurface`. The earlier "minimal 640×480/mime-only probe" was an invalid test (no flag, no color format, no bitrate) and the `component store query: 6` log line is not evidence of a denial (it appears in normal Exynos codec activity). Recorder is fixed (encode flag, `createByCodecName`, explicit surface color format, muxer started at `INFO_OUTPUT_FORMAT_CHANGED` per the canonical state machine) — on-device re-test pending: 10s probe on the 9 Pro, then the Pixel 7, then P1. The ARCore *native* recorder deaths (P1/P2b) remain real, observed failures — now classified as an unresolved ARCore/GrapheneOS interaction, **not** as proof of a general encoder block. | camera ts → normalized PTS → encoder PTS → MP4 PTS → ffprobe; quantify residual. Unblocks P1. |
+| P1 | First real end-to-end capture | **IN PROGRESS — 9 Pro verified 2026-09-01** | ARCore native recorder dead on both fleet Pixels (device bug, bisection below); MediaCodec self-encode is the primary path. **9 Pro (GrapheneOS 17): 30 s capture, 100 % tracking, all `inspect_capture.py` checks pass** (900 encoded frames, exact counter invariants, 29.97 s camera span == 29.99 s container span, zero discontinuities). Remaining: Pixel 7, then a real 90 s walk + stress + interrupted-capture tests. |
+| P2a | MediaCodec timestamp/mux round-trip | **ON-DEVICE VERIFIED on 9 Pro, 2026-09-01** (Pixel 7 pending) | Full encoder pipeline works on the Exynos/Tensor driver after fixing: (1) three MediaCodec API bugs (missing `CONFIGURE_FLAG_ENCODE`, `createEncoderByType()` given a codec name, no `COLOR_FormatSurface` — the "GrapheneOS encoder lockdown" diagnosis is **REJECTED**: stock camera records on both devices); (2) the Exynos EGL driver's **android `EGL14.eglChooseConfig` binding is broken** (zero configs, even NULL-list rejected, `err=0x3000`) — worked around by capturing the javax `EGL10` instance GLSurfaceView itself uses (via the window-surface factory) and driving the encoder surface through it; the driver also rejects custom *context* factories and sentinel indices in `releaseOutputBuffer` (the format-change event must simply be skipped); (3) submit-rate overflow: the encoder input queue holds a few buffers, so 60 fps submissions die after ~3 s — submissions are throttled to the encoder rate (skips counted as drops, never silent); (4) `String.format` without `Locale.US` wrote decimal commas into `poses.json` (de-AT device locale) — invalid JSON. **Container PTS is driver-assigned** on this path (no javax binding for `eglPresentationTimeANDROID`): p50 14.7 ms / p95 30.1 ms / max 54.3 ms residual vs the app's camera-clock PTS, bounded and index-aligned — `frames.json` + persisted origin remain the authoritative timestamp source (by design). | camera ts → normalized PTS → encoder PTS → MP4 PTS → ffprobe; quantify residual. Unblocks P1. |
 | P2b | ARCore native custom-track playback round-trip | **dead end on this fleet (2026-09-01)** | both Pixels: ARCore 1.54 native recorder fatal; see verdict below |
 | P3 | Clock-domain model | **DONE** | `capture-format.md` rewritten: named domains (arcore_frame / android_camera / android_monotonic / wall_clock / sensor / container_pts), guaranteed/measured/unknown, no epoch claims; `frame_timestamp_raw_ns` stored per pose |
 | P4 | De-contradict capture-format.md clocks | **DONE** | same rewrite; "one shared clock" invariant removed; IMU + invariants sections aligned with the domain model |
@@ -377,6 +377,32 @@ android camera timestamp
 
 Expected: identity or a constant, small, documented offset (muxer
 rounding). Any larger drift is a bug, not a property.
+
+### On-device verification — Pixel 9 Pro, 2026-09-01 (GrapheneOS 17)
+
+**Status: pipeline works end-to-end; one documented deviation (driver-
+assigned container PTS).**
+
+- 10 s probe: 293–298 encoded frames @ 30 fps, 28–30 MB H.264,
+  muxer start, finalize, `frames.json` all correct.
+- 30 s tracked capture (phone held at arm's length, textured wall):
+  **1778 poses, 100 % TRACKING, 900 encoded frames, 93.5 MB;
+  `tools/inspect_capture.py` → "RESULT: OK — session passes P1
+  validation"** (counter invariants exact, PTS gaps median 33.332 ms /
+  max 33.412 ms, camera-span vs container-span 29.965 s vs 29.988 s,
+  max speed 0.08 m/s, zero discontinuities).
+- Deviation from the round-trip expectation above: the Exynos driver
+  assigns container PTS itself (presentation time cannot be set through
+  the only working EGL binding — see status table). Measured residual
+  vs the app's camera-clock PTS: p50 14.7 ms, p95 30.1 ms, max 54.3 ms
+  over 900 aligned frames — bounded (≈1–2 frame intervals) and
+  index-aligned, so `frames.json` (camera ts + persisted origin) is the
+  authoritative mapping, exactly as the design anticipated for the
+  "unknown" container-PTS domain. If a future device/driver honors
+  presentation time again, the same check tightens automatically.
+- Pixel 7 (Mali r54) test still pending; the javax-EGL capture trick is
+  driver-independent in code, but the Exynos-specific findings above may
+  not apply (Mali's android-EGL14 binding may be fine).
 
 ## P2b — ARCore native dataset recording (optional / capability-dependent)
 

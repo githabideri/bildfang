@@ -7,6 +7,11 @@ import android.content.pm.PackageManager
 import android.os.Bundle
 import android.os.SystemClock
 import android.opengl.EGL14
+import javax.microedition.khronos.egl.EGL10 as JEGL10
+import javax.microedition.khronos.egl.EGLConfig as JConfig
+import javax.microedition.khronos.egl.EGLContext as JContext
+import javax.microedition.khronos.egl.EGLDisplay as JDisplay
+import javax.microedition.khronos.egl.EGLSurface as JSurface
 import android.opengl.GLSurfaceView
 import android.util.Size
 import android.widget.Button
@@ -84,7 +89,9 @@ class MainActivity : Activity() {
     // Recording state (MediaCodec path — P2a; ARCore's native recorder is
     // dead on GrapheneOS, see docs/ROADMAP.md P1/P2b)
     private var recorder: MediaCodecRecorder? = null
-    private var encoderEglSurface: EGLSurface? = null // GL thread only
+    @Volatile private var eglRef: JEGL10? = null // captured from GLSurfaceView factories
+    private var encoderEglPair: Pair<JDisplay, JSurface>? = null // GL thread only
+    private var lastEncodeCamNs = 0L
     private var sessionDir: File? = null
     private var videoFile: File? = null
     private var camImageSize: Size? = null
@@ -275,6 +282,10 @@ class MainActivity : Activity() {
                 // )
                 stopRequested = false
                 val rec = recorder
+                runCatching {
+                    encoderEglPair?.let { eglRef?.eglDestroySurface(it.first, it.second) }
+                }
+                encoderEglPair = null
                 try {
                     rec?.stop()
                     recording = false
@@ -292,8 +303,7 @@ class MainActivity : Activity() {
                 onFrame(f)
                 drawPreview(f)
                 if (recording) {
-                    val prevSurf = EGL14.eglGetCurrentSurface(3) // EGL_SURFACE
-                    encodeFrame(f, prevSurf)
+                    encodeFrame(f)
                 }
             } catch (e: Exception) {
                 consecutiveUpdateFailures++
@@ -362,74 +372,144 @@ class MainActivity : Activity() {
      * session-relative presentation time (P2a: `android_camera - origin`),
      * swaps, and restores the preview surface. GL thread.
      */
-    private fun encodeFrame(f: Frame, prevSurf: EGLSurface) {
+    /**
+     * Draws the camera frame into the encoder's EGL window surface and
+     * swaps it, submitting the frame's timestamps to the recorder.
+     *
+     * Runs entirely in the *javax* EGL world (the binding GLSurfaceView
+     * uses, proven to work on the Exynos driver): the android EGL14
+     * chooseConfig path returns zero configs on this device, so the
+     * encoder surface is created via javax EGL10 and driven with
+     * javax makeCurrent/swap. There is no javax binding for
+     * eglPresentationTimeANDROID, so the MP4 container PTS is left to
+     * the driver default — frames.json (camera clock, session origin)
+     * remains the authoritative timestamp mapping.
+     */
+    /**
+     * Draws the camera frame into the encoder's EGL window surface and
+     * swaps it, submitting the frame's timestamps to the recorder.
+     *
+     * Driven through the javax EGL10 implementation (the binding family
+     * the GLSurfaceView preview uses — the android EGL14 binding returns
+     * zero configs on the Exynos driver). No javax binding exists for
+     * eglPresentationTimeANDROID, so the MP4 container PTS is left to
+     * the driver default; frames.json (camera clock + session origin)
+     * remains the authoritative timestamp mapping.
+     */
+    /**
+     * Draws the camera frame into the encoder's EGL window surface and
+     * swaps it, submitting the frame's timestamps to the recorder.
+     *
+     * Driven through the captured javax EGL10 instance (the binding
+     * family the GLSurfaceView preview uses; the android EGL14 binding
+     * returns zero configs on the Exynos driver). No javax binding
+     * exists for eglPresentationTimeANDROID, so the MP4 container PTS
+     * is left to the driver default; frames.json (camera clock +
+     * session origin) remains the authoritative timestamp mapping.
+     */
+    private fun encodeFrame(f: Frame) {
         val rec = recorder ?: return
-        val display = EGL14.eglGetCurrentDisplay()
-        val ctx = EGL14.eglGetCurrentContext()
-        var encSurf = encoderEglSurface
-        if (encSurf == null) {
-            encSurf = createEncoderEglSurface(display) ?: run {
+        val j = eglRef ?: return
+        // The encoder input buffer queue holds only a few buffers and the
+        // encoder consumes at its own frame rate: submitting at the camera
+        // rate (60 fps) overflows it within ~3 s and every later swap fails
+        // with EGL_BAD_SURFACE. Throttle submissions to the encoder rate
+        // (skipped frames are counted as drops, never silent).
+        val camTs = f.androidCameraTimestamp
+        if (lastEncodeCamNs != 0L) {
+            val intervalNs = 1_000_000_000L / rec.fps
+            if (camTs - lastEncodeCamNs < intervalNs - 2_000_000L) {
                 rec.dropFrame()
                 return
             }
-            encoderEglSurface = encSurf
         }
-        if (!EGL14.eglMakeCurrent(display, encSurf, encSurf, ctx)) {
-            android.util.Log.e("bildfang", "eglMakeCurrent(encoder) failed")
+        var pair = encoderEglPair
+        if (pair == null) {
+            // Creation can be expensive on a picky driver; only retry every
+            // 30 frames so a persistent failure doesn't flood the log.
+            if (drawFrameCount % 30 != 0) {
+                rec.dropFrame()
+                return
+            }
+            pair = createEncoderEglSurfaceJ() ?: run {
+                rec.dropFrame()
+                return
+            }
+            encoderEglPair = pair
+        }
+        val ctx = j.eglGetCurrentContext()
+        val prev = j.eglGetCurrentSurface(JEGL10.EGL_DRAW)
+        if (!j.eglMakeCurrent(pair.first, pair.second, pair.second, ctx)) {
+            android.util.Log.e("bildfang", "javax eglMakeCurrent(encoder) failed")
             rec.dropFrame()
-            return // makeCurrent failed: preview surface is still current
+            return
         }
         val tex = f.cameraTextureName.takeIf { it != 0 } ?: oesTextureId
         if (tex == 0) {
-            EGL14.eglMakeCurrent(display, prevSurf, prevSurf, ctx)
+            j.eglMakeCurrent(pair.first, prev, prev, ctx)
             rec.dropFrame()
             return
         }
         drawQuad(tex)
-        val camTs = f.androidCameraTimestamp
-        val origin = rec.ensureOrigin(camTs)
-        EGLExt.eglPresentationTimeANDROID(display, encSurf, camTs - origin)
-        if (!EGL14.eglSwapBuffers(display, encSurf)) {
-            android.util.Log.e("bildfang", "eglSwapBuffers(encoder) failed")
-            EGL14.eglMakeCurrent(display, prevSurf, prevSurf, ctx)
+        rec.ensureOrigin(camTs)
+        if (!j.eglSwapBuffers(pair.first, pair.second)) {
+            android.util.Log.e("bildfang", "javax eglSwapBuffers(encoder) failed")
+            j.eglMakeCurrent(pair.first, prev, prev, ctx)
             rec.dropFrame()
             return
         }
-        EGL14.eglMakeCurrent(display, prevSurf, prevSurf, ctx)
+        j.eglMakeCurrent(pair.first, prev, prev, ctx)
+        lastEncodeCamNs = camTs
         rec.submitFrame(camTs, f.timestamp)
         val pi = synchronized(posesLock) { poses.lastIndex }
         rec.attachPoseIndex(rec.lastFrameIndex, pi)
     }
 
     /** EGL window surface over the encoder's input Surface. GL thread. */
-    private fun createEncoderEglSurface(display: EGLDisplay): EGLSurface? {
+    /**
+     * Creates the encoder's EGL window surface through the *captured*
+     * javax EGL10 instance (the same one that drives our GLSurfaceView
+     * preview, which the Exynos driver handles; the android EGL14
+     * binding returns zero configs on this device). May be called from
+     * the main thread at recording start or lazily from the GL thread.
+     * Returns (display, surface).
+     */
+    private fun createEncoderEglSurfaceJ(): Pair<JDisplay, JSurface>? {
         val rec = recorder ?: return null
-        val version = IntArray(1)
-        EGL14.eglQueryContext(display, EGL14.eglGetCurrentContext(),
-            EGL14.EGL_CONTEXT_CLIENT_VERSION, version, 0)
-        val renderable = if (version[0] >= 3) 0x40 else EGL14.EGL_OPENGL_ES2_BIT // EGL_OPENGL_ES3_BIT=0x40
-        val attribs = intArrayOf(
-            EGL14.EGL_RENDERABLE_TYPE, renderable,
-            EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT,
-            EGL14.EGL_RED_SIZE, 8,
-            EGL14.EGL_GREEN_SIZE, 8,
-            EGL14.EGL_BLUE_SIZE, 8,
-            EGL14.EGL_ALPHA_SIZE, 8,
-            EGL14.EGL_NONE, 0
-        )
-        val configs = arrayOfNulls<EGLConfig>(1)
-        val num = IntArray(1)
-        if (!EGL14.eglChooseConfig(display, attribs, 0, configs, 1, 0, num, 0) || num[0] == 0) {
-            android.util.Log.e("bildfang", "eglChooseConfig(encoder) failed")
+        val j = eglRef ?: run {
+            android.util.Log.e("bildfang", "no captured EGL10 instance yet")
             return null
         }
-        val surf = EGL14.eglCreateWindowSurface(display, configs[0], rec.encoderSurface,
-            intArrayOf(EGL14.EGL_NONE, 0), 0)
-        if (surf == EGL14.EGL_NO_SURFACE) {
-            android.util.Log.e("bildfang", "eglCreateWindowSurface(encoder) failed")
-            return null
+        return try {
+            val disp = j.eglGetDisplay(JEGL10.EGL_DEFAULT_DISPLAY)
+            j.eglInitialize(disp, null)
+            val attribs = intArrayOf(
+                JEGL10.EGL_RENDERABLE_TYPE, 0x4, // EGL_OPENGL_ES2_BIT (not in the javax stub)
+                JEGL10.EGL_SURFACE_TYPE, JEGL10.EGL_WINDOW_BIT,
+                JEGL10.EGL_RED_SIZE, 8,
+                JEGL10.EGL_GREEN_SIZE, 8,
+                JEGL10.EGL_BLUE_SIZE, 8,
+                JEGL10.EGL_ALPHA_SIZE, 8,
+                JEGL10.EGL_NONE)
+            val cfgs = arrayOfNulls<JConfig>(1)
+            val num = IntArray(1)
+            j.eglChooseConfig(disp, attribs, cfgs, 1, num)
+            if (num[0] == 0 || cfgs[0] == null) {
+                android.util.Log.e("bildfang", "javax eglChooseConfig: 0 configs (err=${j.eglGetError()})")
+                return null
+            }
+            android.util.Log.i("bildfang", "javax eglChooseConfig: ${num[0]} match(es)")
+            val surf = j.eglCreateWindowSurface(disp, cfgs[0], rec.encoderSurface, null)
+            if (surf == null || surf == JEGL10.EGL_NO_SURFACE) {
+                android.util.Log.e("bildfang", "javax eglCreateWindowSurface(encoder) failed")
+                return null
+            }
+            android.util.Log.i("bildfang", "javax encoder EGL surface created")
+            Pair(disp, surf)
+        } catch (e: Exception) {
+            android.util.Log.e("bildfang", "javax encoder EGL: ${e.javaClass.simpleName} ${e.message}")
+            null
         }
-        return surf
     }
 
     /**
@@ -518,6 +598,23 @@ class MainActivity : Activity() {
 
         glView.setEGLContextClientVersion(2)
         glView.setEGLConfigChooser(8, 8, 8, 8, 16, 0)
+        // Capture the javax EGL10 implementation instance GLSurfaceView
+        // uses (com.google.android.gles_jni.EGLImpl on this device): the
+        // android EGL14 binding is broken on this driver (chooseConfig
+        // returns zero configs), but this instance - the one that creates
+        // our preview context and surface - works. We only override the
+        // *window surface* factory (stock behavior, plus the capture);
+        // the stock context factory stays in place because the Exynos
+        // driver rejects custom-context-factory eglCreateContext calls.
+        glView.setEGLWindowSurfaceFactory(object : GLSurfaceView.EGLWindowSurfaceFactory {
+            override fun createWindowSurface(egl: JEGL10, display: JDisplay, config: JConfig, window: Any): JSurface? {
+                eglRef = egl
+                return egl.eglCreateWindowSurface(display, config, window, null)
+            }
+            override fun destroySurface(egl: JEGL10, display: JDisplay, surface: JSurface) {
+                egl.eglDestroySurface(display, surface)
+            }
+        })
         glView.setRenderer(renderer)
         glView.renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
 
@@ -686,7 +783,13 @@ class MainActivity : Activity() {
             return
         }
         recorder = rec
-        encoderEglSurface = null // (re)created lazily on the GL thread
+        encoderEglPair = null
+        lastEncodeCamNs = 0L
+        // Pre-create the encoder's EGL window surface on the main thread
+        // (javax world); the GL thread then only makeCurrent/swap.
+        runCatching {
+            encoderEglPair = createEncoderEglSurfaceJ()
+        }
         recording = true
         startBtn.isEnabled = false
         stopBtn.isEnabled = true

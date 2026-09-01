@@ -45,7 +45,9 @@ object PoseJson {
     const val SCHEMA = "bildfang-capture/v1-poses"
     const val COORDINATE_SYSTEM = "arcore-world-v1"
 
-    private fun f(v: Float): String = String.format("%.6f", v)
+    // Locale.US is mandatory: the device locale (de-AT) uses decimal
+    // commas, which corrupted poses.json into invalid JSON (2026-09-01).
+    private fun f(v: Float): String = String.format(Locale.US, "%.6f", v)
 
     fun build(records: List<PoseRecord>): String {
         // Normalize each segment so its first pose is exactly (0,0,0)

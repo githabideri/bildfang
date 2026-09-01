@@ -44,7 +44,7 @@ import kotlin.concurrent.withLock
 class MediaCodecRecorder(
     private val width: Int,
     private val height: Int,
-    private val fps: Int,
+    val fps: Int,
     private val bitrate: Int, // initial experiment: ~25 Mbit/s for 1080p30
     private val outputDir: File,
 ) : VideoRecorder {
@@ -281,7 +281,12 @@ class MediaCodecRecorder(
                     muxerStarted = true
                     android.util.Log.i("bildfang", "muxer started at INFO_OUTPUT_FORMAT_CHANGED (track $muxerTrack, ${c.outputFormat})")
                 }
-                c.releaseOutputBuffer(r, false)
+                // The format-change event carries no real buffer. AOSP
+                // convention is to consume it via releaseOutputBuffer(
+                // INFO_OUTPUT_END_OF_STREAM), but the Exynos C2 port rejects
+                // sentinel indices ("index out of range", crash on-device
+                // 2026-09-01) — so it is simply skipped; it is a one-shot
+                // event per stream and holds no buffer to leak.
                 quiescent = 0
                 continue
             }
