@@ -27,6 +27,7 @@ signature)."""
 
 import json
 import math
+import numpy as np
 import shutil
 import subprocess
 import sys
@@ -402,7 +403,92 @@ def main():
                      "derive the transform in P3 before any invariant")
 
     geometry_section(session_dir, sess, vs)
+    if "orientation" not in sess or "video" not in sess:
+        # pre-1.1 sessions: geometry model unavailable, but the video-level
+        # border scan still applies (it is what flags the washroom-class bug)
+        border_scan_section(session_dir, vs)
     finish(dur)
+
+
+def border_scan_section(session_dir: Path, vs) -> None:
+    """Constant-border scan (the 2026-09-02 viewport-bug detector).
+
+    Video-level, so it applies to v1.1 AND pre-1.1 sessions. A genuine
+    fill is 2D-constant (std ~ 0); low-texture real content (walls) is not.
+    """
+    if not (shutil.which("ffmpeg") and vs):
+        note("ffmpeg not available — constant-border scan skipped")
+        return
+    video_p = session_dir / "video" / "camera.mp4"
+    if not video_p.is_file():
+        legacy = session_dir / "video.mp4"
+        video_p = legacy if legacy.is_file() else video_p
+    import re
+    import tempfile
+    total_f = int(vs.get("nb_frames") or 100)
+    sess_d = json.loads((session_dir / "session.json").read_text())
+    dur_s = sess_d.get("duration_s") or (total_f / 30.0)
+    times = [max(0.05, (i + 0.5) * float(dur_s) / 9) for i in range(9)]
+    worst_frac = 1.0
+    worst = {"l": 0, "r": 0, "t": 0, "b": 0}
+    scanned = 0
+    with tempfile.TemporaryDirectory() as td:
+        for i, t in enumerate(times):
+            out = Path(td) / f"f{i}.ppm"
+            r = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{t:.2f}",
+                                "-i", str(video_p), "-frames:v", "1",
+                                "-vf", "scale=iw/4:ih/4", str(out)],
+                               capture_output=True, text=True, timeout=60)
+            if r.returncode != 0 or not out.is_file():
+                continue
+            txt = out.read_bytes()
+            m = re.match(rb"P[67]\s+(\d+)\s+(\d+)\s+255", txt)
+            if not m:
+                continue
+            w, h = int(m.group(1)), int(m.group(2))
+            raw = txt[m.end():]
+            if len(raw) < w * h * 3:
+                continue
+            px = np.array(
+                [[raw[j * 3] + raw[j * 3 + 1] + raw[j * 3 + 2]
+                  for j in range(x * w, (x + 1) * w)] for x in range(h)])
+
+            def block_std(x0, x1, y0, y1):
+                return float(px[y0:y1, x0:x1].std())
+
+            # A genuine viewport fill is 2D-CONSTANT (std ~ 0). A low-texture
+            # wall has a gradient/noise — its block std grows as the region
+            # widens. Extending a border only while the accumulated block stays
+            # near-constant separates the two (fixes the 2026-09-03 Pixel-7
+            # plain-wall false positive).
+            l = 0
+            while l < w * 0.5 and block_std(0, l + 1, 0, h) < 3.0: l += 1
+            r_ = 0
+            while r_ < w * 0.5 and block_std(w - 1 - r_, w, 0, h) < 3.0: r_ += 1
+            t_ = 0
+            while t_ < h * 0.5 and block_std(0, w, 0, t_ + 1) < 3.0: t_ += 1
+            b_ = 0
+            while b_ < h * 0.5 and block_std(0, w, h - 1 - b_, h) < 3.0: b_ += 1
+            frac = ((w - l - r_) * (h - t_ - b_)) / (w * h)
+            scanned += 1
+            worst_frac = min(worst_frac, frac)
+            worst["l"] = max(worst["l"], l)
+            worst["r"] = max(worst["r"], r_)
+            worst["t"] = max(worst["t"], t_)
+            worst["b"] = max(worst["b"], b_)
+    if scanned == 0:
+        note("border scan: no frames extractable — skipped")
+        return
+    ok = worst_frac >= 0.9
+    check(f"no constant image borders (scanned {scanned} frames @ 1/4 scale)", ok,
+          f"min active fraction {worst_frac * 100:.1f}% "
+          f"(L{worst['l']} R{worst['r']} T{worst['t']} B{worst['b']} of {int(vs.get('width')) // 4}x{int(vs.get('height')) // 4})")
+    if not ok:
+        note("constant-border scan found large 2D-constant regions — classic "
+             "signature of the encoder-viewport bug or a letterboxed source. "
+             "(Low-texture real content such as plain walls no longer triggers "
+             "this check: a genuine fill is bit-identical, a wall is not.) Do "
+             "NOT use this session for photometric work until inspected visually.")
 
 
 def geometry_section(session_dir: Path, sess: dict, vs) -> None:
@@ -507,77 +593,7 @@ def geometry_section(session_dir: Path, sess: dict, vs) -> None:
             if stab:
                 note(f"stabilization config: {stab}")
 
-    # --- constant-border scan (the 2026-09-02 viewport-bug detector) ---
-    if not (shutil.which("ffmpeg") and vs):
-        note("ffmpeg not available — constant-border scan skipped")
-        return
-    video_p = session_dir / "video" / "camera.mp4"
-    if not video_p.is_file():
-        legacy = session_dir / "video.mp4"
-        video_p = legacy if legacy.is_file() else video_p
-    import re
-    import tempfile
-    total_f = int(vs.get("nb_frames") or 100)
-    dur_s = sess.get("duration_s") or (total_f / 30.0)
-    times = [max(0.05, (i + 0.5) * float(dur_s) / 9) for i in range(9)]
-    worst_frac = 1.0
-    worst = {"l": 0, "r": 0, "t": 0, "b": 0}
-    scanned = 0
-    with tempfile.TemporaryDirectory() as td:
-        for i, t in enumerate(times):
-            out = Path(td) / f"f{i}.ppm"
-            r = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{t:.2f}",
-                                "-i", str(video_p), "-frames:v", "1",
-                                "-vf", "scale=iw/4:ih/4", str(out)],
-                               capture_output=True, text=True, timeout=60)
-            if r.returncode != 0 or not out.is_file():
-                continue
-            txt = out.read_bytes()
-            m = re.match(rb"P[67]\s+(\d+)\s+(\d+)\s+255", txt)
-            if not m:
-                continue
-            w, h = int(m.group(1)), int(m.group(2))
-            raw = txt[m.end():]
-            if len(raw) < w * h * 3:
-                continue
-            px = [raw[j * 3] + raw[j * 3 + 1] + raw[j * 3 + 2] for j in range(w * h)]
-
-            def rowstd(y):
-                seg = px[y * w:(y + 1) * w]
-                mean = sum(seg) / len(seg)
-                return (sum((x - mean) ** 2 for x in seg) / len(seg)) ** 0.5
-
-            def colstd(x):
-                seg = [px[y * w + x] for y in range(h)]
-                mean = sum(seg) / len(seg)
-                return (sum((v - mean) ** 2 for v in seg) / len(seg)) ** 0.5
-
-            l = 0
-            while l < w * 0.5 and rowstd(l) < 8: l += 1
-            r_ = 0
-            while r_ < w * 0.5 and rowstd(h - 1 - r_) < 8: r_ += 1
-            t_ = 0
-            while t_ < h * 0.5 and colstd(t_) < 8: t_ += 1
-            b_ = 0
-            while b_ < h * 0.5 and colstd(w - 1 - b_) < 8: b_ += 1
-            frac = ((w - l - r_) * (h - t_ - b_)) / (w * h)
-            scanned += 1
-            worst_frac = min(worst_frac, frac)
-            worst["l"] = max(worst["l"], l)
-            worst["r"] = max(worst["r"], r_)
-            worst["t"] = max(worst["t"], t_)
-            worst["b"] = max(worst["b"], b_)
-    if scanned == 0:
-        note("border scan: no frames extractable — skipped")
-        return
-    ok = worst_frac >= 0.9
-    check(f"no constant image borders (scanned {scanned} frames @ 1/4 scale)", ok,
-          f"min active fraction {worst_frac * 100:.1f}% "
-          f"(L{worst['l']} R{worst['r']} T{worst['t']} B{worst['b']} of {int(vs.get('width')) // 4}x{int(vs.get('height')) // 4})")
-    if not ok:
-        note("constant-border scan found large flat regions — classic signature "
-             "of the encoder-viewport bug or a letterboxed source. Do NOT use "
-             "this session for photometric work until inspected visually.")
+    border_scan_section(session_dir, vs)
 
 
 def get_pts_ns(video_p: Path, vs) -> list:
