@@ -380,6 +380,23 @@ the next meaningful trajectory for the pipeline).
 No long reconstruction run (COLMAP/VGGT/MASt3R/GS) is justified until T01–T02
 pass; multiple GPU-hours are only spent after T05.
 
+**BF-T03 PASS (2026-09-02, human, Pixel 9 Pro, build 0.3.0 with orthogonal K):**
+- `capture-20260902T231840-95c91278` — 31.1 s, 1831 poses @ 59 Hz, 100 %
+  tracking, 0 discontinuities, 313° total heading change, extent
+  1.32×0.71×0.92 m, start→end 0.64 m.
+- `capture-20260902T231925-adba4e76` — **38.2 s walk with corner turns**:
+  2244 poses @ 58.7 Hz, 100 % tracking, 0 discontinuits/relocalizations,
+  0 jumps > 0.5 m, 304° total heading change, extent 1.68×1.01×1.10 m,
+  start→end displacement 0.40 m, 906×1330 video, 1129 frames, exact
+  counters, K_encoded rot 270 consistent, 7/7 metadata keys, border scan
+  100 %.
+Both pass the full validator end-to-end. The 38 s session is the **first
+reconstruction-eligible clean Bildfang dataset**; it was delivered to the
+Bildwerk dev agent (CT 239 `/root/bildfang-bft03-2026-09-02/`, handoff note
+`temp/bildwerk-private/HANDOFF-BFT03-2026-09-02.md`) for the one small
+A/B/C comparison run (COLMAP / HLOC / ARCore trajectory, then a small GS
+test) — no long runs yet.
+
 ## P2a — MediaCodec recorder: architecture, timestamp round-trip (REQUIRED)
 
 **The primary, portable, preservation-grade recorder.** Replaces the
