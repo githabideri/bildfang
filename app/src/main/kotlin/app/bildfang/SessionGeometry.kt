@@ -265,20 +265,55 @@ object GeometryMath {
      * pixel -> texture pixel -> K_src^-1 ray) and this returns null.
      * Never invent numbers: null is the honest answer.
      */
+    /**
+     * Rotation class of an affine mapping: the k in `M ≈ R(k) · S` with R a
+     * 90° multiple rotation and S a diagonal scale — 0 (identity or
+     * axis-flips), 90 (CCW), 180, 270 — or −1 when M has genuine shear /
+     * non-orthogonal structure.
+     */
+    fun mappingRotationDeg(aff: FloatArray): Int {
+        val m00 = aff[0]; val m01 = aff[1]; val m10 = aff[3]; val m11 = aff[4]
+        val scale = maxOf(abs(m00), abs(m01), abs(m10), abs(m11), 1e-9f)
+        val off = { v: Float -> abs(v) <= 1e-3f * scale }
+        return when {
+            off(m01) && off(m10) -> if (m00 < 0.0 && m11 < 0.0) 180 else 0
+            off(m00) && off(m11) -> if (m01 < 0.0 && m10 > 0.0) 90 else 270
+            else -> -1
+        }
+    }
+
+    /**
+     * A zero-skew (rectilinear) K for the encoded image exists for every
+     * 0/90/180/270-degree axis permutation with independent scale and
+     * translation (M = R(k)·S, S diagonal): those are ordinary pinhole
+     * images in encoded pixel coordinates (for 90/270 the focal lengths
+     * swap axes and the principal point is carried through the rotation).
+     * Only genuine shear / non-orthogonal M returns null — then no
+     * zero-skew K exists and the affine chain with source intrinsics is
+     * the model. Never fabricate intrinsics.
+     */
     fun tryExactRectilinear(src: CameraIntrinsics, aff: FloatArray): CameraIntrinsics? {
-        val m00 = aff[0].toDouble()
-        val m01 = aff[1].toDouble()
-        val m10 = aff[3].toDouble()
-        val m11 = aff[4].toDouble()
-        if (abs(m01) > 1e-4 || abs(m10) > 1e-4) return null
-        if (m00 == 0.0 || m11 == 0.0) return null
-        return CameraIntrinsics(
-            width = src.width, // replaced by the caller with the encoded size
-            height = src.height,
-            fx = src.fx / m00,
-            fy = src.fy / m11,
-            cx = src.cx - aff[2] / m00,
-            cy = src.cy - aff[5] / m11,
-        )
+        val m00 = aff[0].toDouble(); val m01 = aff[1].toDouble()
+        val m10 = aff[3].toDouble(); val m11 = aff[4].toDouble()
+        val tx = aff[2].toDouble(); val ty = aff[5].toDouble()
+        val scale = maxOf(abs(m00), abs(m01), abs(m10), abs(m11), 1e-9)
+        val off = { v: Double -> abs(v) <= 1e-3 * scale }
+        return when {
+            // 0°/180°: p_src = (m00·u + tx, m11·v + ty)
+            off(m01) && off(m10) && abs(m00) > 1e-9 && abs(m11) > 1e-9 ->
+                CameraIntrinsics(
+                    width = src.width, height = src.height,
+                    fx = src.fx / abs(m00), fy = src.fy / abs(m11),
+                    cx = (src.cx - tx) / m00, cy = (src.cy - ty) / m11,
+                )
+            // 90°/270°: p_src = (m01·v + tx, m10·u + ty) — axes swap
+            off(m00) && off(m11) && abs(m01) > 1e-9 && abs(m10) > 1e-9 ->
+                CameraIntrinsics(
+                    width = src.width, height = src.height,
+                    fx = src.fy / abs(m10), fy = src.fx / abs(m01),
+                    cx = (src.cy - ty) / m10, cy = (src.cx - tx) / m01,
+                )
+            else -> null
+        }
     }
 }

@@ -123,9 +123,16 @@ class SessionGeometryTest {
         for (i in 0 until 6) {
             assertEquals(expected[i], aff[i], 1e-3f)
         }
-        // A 90° mapping must NOT yield a rectilinear model.
+        // A 90° mapping IS still a rectilinear pinhole image in encoded
+        // pixels (axes swap): the derived K must exist with swapped
+        // focal lengths and the principal point carried through.
         val k = CameraIntrinsics(640, 480, 100.0, 150.0, 320.0, 240.0)
-        assertNull(GeometryMath.tryExactRectilinear(k, aff))
+        val ke = GeometryMath.tryExactRectilinear(k, aff)!!
+        assertEquals(150.0, ke.fx, 1e-3)   // fy_s / |m10|
+        assertEquals(100.0, ke.fy, 1e-3)   // fx_s / |m01|
+        assertEquals(240.0, ke.cx, 1e-3)   // (cy_s - ty) / m10
+        assertEquals(320.0, ke.cy, 1e-3)   // (cx_s - tx) / m01 = (320-640)/-1
+        assertEquals(90, GeometryMath.mappingRotationDeg(aff))
     }
 
     @Test
@@ -135,21 +142,56 @@ class SessionGeometryTest {
         val k = GeometryMath.tryExactRectilinear(src, aff)!!
         assertEquals(200.0, k.fx, 1e-9)
         assertEquals(300.0, k.fy, 1e-9)
-        assertEquals(160.0, k.cx, 1e-9)
-        assertEquals(120.0, k.cy, 1e-9)
-        // with translation: cx shifts by -tx/m00
+        assertEquals(320.0, k.cx, 1e-9)   // (160 - 0) / 0.5
+        assertEquals(240.0, k.cy, 1e-9)   // (120 - 0) / 0.5
+        // with scale + translation: cx = (cx_s - tx)/m00, cy = (cy_s - ty)/m11
         val aff2 = floatArrayOf(2f, 0f, 10f, 0f, 3f, 20f)
         val k2 = GeometryMath.tryExactRectilinear(src, aff2)!!
         assertEquals(50.0, k2.fx, 1e-9)
         assertEquals(50.0, k2.fy, 1e-9)
-        assertEquals(155.0, k2.cx, 1e-9)
-        assertEquals(120.0 - 20.0 / 3.0, k2.cy, 1e-9)
+        assertEquals(75.0, k2.cx, 1e-9)
+        assertEquals(100.0 / 1.0 * 0.0 + (120.0 - 20.0) / 3.0, k2.cy, 1e-9)
     }
 
     @Test
-    fun `tryExactRectilinear refuses rotation and shear`() {
+    fun `tryExactRectilinear accepts all four orthogonal rotations`() {
+        val src = CameraIntrinsics(320, 240, 100.0, 150.0, 160.0, 120.0)
+        // 0° (scale + translation)
+        val k0 = GeometryMath.tryExactRectilinear(src, floatArrayOf(0.5f, 0f, 10f, 0f, 0.5f, 5f))!!
+        assertEquals(200.0, k0.fx, 1e-9); assertEquals(300.0, k0.fy, 1e-9)
+        assertEquals(300.0, k0.cx, 1e-9); assertEquals(230.0, k0.cy, 1e-9)
+        assertEquals(0, GeometryMath.mappingRotationDeg(floatArrayOf(0.5f, 0f, 10f, 0f, 0.5f, 5f)))
+        // 90° CCW: M = [[0,-1],[1,0]] + t
+        val aff90 = floatArrayOf(0f, -1f, 100f, 1f, 0f, 0f)
+        val k90 = GeometryMath.tryExactRectilinear(src, aff90)!!
+        assertEquals(150.0, k90.fx, 1e-3)   // fy_s / |m10|
+        assertEquals(100.0, k90.fy, 1e-3)   // fx_s / |m01|
+        assertEquals(120.0, k90.cx, 1e-3)   // (cy_s - ty) / m10
+        assertEquals(-60.0, k90.cy, 1e-3)   // (cx_s - tx) / m01
+        assertEquals(90, GeometryMath.mappingRotationDeg(aff90))
+        // 180°: M = [[-1,0],[0,-1]]
+        val aff180 = floatArrayOf(-1f, 0f, 320f, 0f, -1f, 240f)
+        val k180 = GeometryMath.tryExactRectilinear(src, aff180)!!
+        assertEquals(100.0, k180.fx, 1e-9)
+        assertEquals(150.0, k180.fy, 1e-9)
+        assertEquals(160.0, k180.cx, 1e-9)   // (160 - 320) / -1
+        assertEquals(120.0, k180.cy, 1e-9)   // (120 - 240) / -1
+        assertEquals(180, GeometryMath.mappingRotationDeg(aff180))
+        // 270°: M = [[0,1],[-1,0]]
+        val aff270 = floatArrayOf(0f, 1f, 0f, -1f, 0f, 0f)
+        val k270 = GeometryMath.tryExactRectilinear(src, aff270)!!
+        assertEquals(150.0, k270.fx, 1e-9)   // fy_s / |m10|
+        assertEquals(100.0, k270.fy, 1e-9)   // fx_s / |m01|
+        assertEquals(-120.0, k270.cx, 1e-9)  // (cy_s - ty) / m10 = 120 / -1
+        assertEquals(160.0, k270.cy, 1e-9)   // (cx_s - tx) / m01 = 160 / 1
+        assertEquals(270, GeometryMath.mappingRotationDeg(aff270))
+    }
+
+    @Test
+    fun `tryExactRectilinear refuses genuine shear`() {
         val src = CameraIntrinsics(320, 240, 100.0, 150.0, 160.0, 120.0)
         assertNull(GeometryMath.tryExactRectilinear(src, floatArrayOf(0.5f, 0.1f, 0f, 0f, 0.5f, 0f)))
-        assertNull(GeometryMath.tryExactRectilinear(src, floatArrayOf(0f, -1f, 100f, 1f, 0f, 0f)))
+        assertNull(GeometryMath.tryExactRectilinear(src, floatArrayOf(0.5f, 0f, 0f, 0.2f, 0.5f, 0f)))
+        assertEquals(-1, GeometryMath.mappingRotationDeg(floatArrayOf(0.5f, 0.1f, 0f, 0f, 0.5f, 0f)))
     }
 }

@@ -28,6 +28,14 @@ folder can be dropped into a Bildwerk ingestion flow without renaming.
 **Encoding:** all text files UTF-8. JSON: 2-space indent, one entry per line
 where reasonable. CSV: LF line endings, CRLF-free.
 
+> **Reading this document:** sections marked **[planned]** describe the
+> target `bildfang-capture/v1` schema. What build 0.3.x actually writes is
+> documented in **`session.json` — what build 0.3.0 actually writes**
+> further down; where the two differ, that section wins for current
+> captures. The ARCore-native-recording design described in places is a
+> **dead end on the current fleet** (see ROADMAP P2b) and is kept only as
+> history.
+
 ---
 
 ## The clocks — named domains, not one clock
@@ -42,10 +50,10 @@ opaque, raw value preserved).
 |-------------|--------|-----------------|
 | `arcore_frame` | `Frame.getTimestamp()` | **Unknown/opaque.** ARCore documents no epoch. On ARCore 1.54 / Pixel 7 (2026-09-01) it is observed to be a fixed, monotonic value around ≈1.78×10¹⁸ ns — an observation, not a contract; do not code against it. |
 | `android_camera` | `Frame.getAndroidCameraTimestamp()` | HAL camera clock (the timestamp the camera HAL attaches to each image). Its relation to the encoded video PTS is **measured in P1/P2** (ffprobe PTS + ARCore playback TrackData timestamps) and documented with a residual before any invariant is claimed. |
-| `android_monotonic` | `SystemClock.elapsedRealtimeNanos()` (also `SensorEvent.timestamp`) | Monotonic since boot, pauses on device sleep. Shared by the IMU samples and by bildfang's own sampling; **not** shared with `arcore_frame`. |
+| `android_monotonic` | `SystemClock.elapsedRealtimeNanos()` (also `SensorEvent.timestamp`) | Monotonic since boot; **keeps counting through device sleep** (unlike `uptimeNanos()`). Shared by the IMU samples and by bildfang's own sampling; **not** shared with `arcore_frame`. Sensor *samples* can stop while the sensor is suspended — gaps in the data, not in the clock. |
 | `wall_clock` | `System.currentTimeMillis()` / ISO 8601 UTC | Human provenance only (session start/end, `created_utc`). |
 | `sensor` | `SensorEvent.timestamp` | On Android this *is* `android_monotonic`; listed separately so a future platform change is a schema note, not a silent break. |
-| `container_pts` | MP4 presentation timestamps | Whatever clock the muxer was fed (for ARCore-native recordings: derived from the camera image timestamps — to be verified in P1/P2). |
+| `container_pts` | MP4 presentation timestamps | **Current MediaCodec/EGL10 path: driver-assigned** (the javax EGL has no `eglPresentationTimeANDROID` binding; the app cannot write encoder-frame presentation times). Measured offset vs `android_camera` in P2a (index-aligned, bounded residual; `frames.json` stays the authoritative timestamp source). The ARCore-native path (PTS derived from camera timestamps) is a dead end on this fleet. |
 
 **What bildfang stores:** raw values in each domain are always preserved
 (`frame.timestamp` raw, `Frame.getAndroidCameraTimestamp()`,
@@ -74,27 +82,35 @@ the domains are equal.
   and an embedded custom-track record written to the same `Frame` belong
   to the same camera frame; units are as documented; each field's domain
   is as tabled above.
-- **Measured** (pending, P1/P2): the transformation between
-  `android_camera` and `container_pts` for the ARCore-native MP4 —
-  expected to be identity or a constant offset; the residual is recorded
-  when measured.
+- **Measured** (done, P2a 2026-09-01): the relationship between
+  `android_camera` and `container_pts` on the current MediaCodec path —
+  index-aligned, bounded residual (p50 ≈ 3–55 ms depending on device/driver;
+  recorded per session), **driver-assigned** container PTS, never free-
+  running: `frames.json` presentation values (camera-clock-derived) are
+  authoritative, container PTS is measured and reported, never asserted
+  equal.
 - **Unknown/opaque**: the epoch of `arcore_frame`. Never asserted, never
   transformed away — the raw value is always stored alongside the derived
   one.
 
-> The Phase-0 ideal (one shared `elapsedRealtimeNanos` clock across all
-> files, `manifest.json` with sha256 hashes, separate `imu.csv` /
-> `frames.json` / `intrinsics.json`) remains the target for later versions
-> — as a *derived, clearly-labeled* convenience on top of the raw domain
-> values, not as a claim about the sources. The current app (v0.2.x)
-> writes `session.json` + `poses/poses.json` + `video.mp4` (ARCore-native
-> MP4, which embeds the IMU and a custom JSON pose track in the container
-> itself).
+> **Legacy (v0.1/v0.2.x plans):** one shared `elapsedRealtimeNanos` clock
+> across all files, `manifest.json` with sha256 hashes, an ARCore-native
+> `video.mp4` embedding IMU and a custom JSON pose track, separate
+> `imu.csv` / `intrinsics.json`. Parts of that remain the *target* for
+> later versions as clearly-labeled derived conveniences on top of the raw
+> domain values — never as a claim about the sources. The current app
+> (v0.3.x) writes the self-describing session folder described in the
+> `session.json` section below (MediaCodec-encoded `video/camera.mp4`,
+> authoritative `video/frames.json`, `poses/poses.json`,
+> `camera/frames.json` camera metadata).
 
-## `manifest.json`
+## `manifest.json` **[planned — not written by current builds]**
 
 Written last, atomically (write to `manifest.json.tmp` then rename). A
-session without a complete `manifest.json` is invalid/incomplete.
+session without a complete `manifest.json` is invalid/incomplete. The
+current build's completeness marker is instead a fully-populated
+`session.json` (written after the video finalize); `sha256` file hashes
+remain a target for a future build.
 
 ```json
 {
@@ -181,9 +197,9 @@ chosen for tooling ergonomics at this size).
   `"segment": 1, 2, …`, default `0`). Consumers must only interpolate
   within a segment.
 
-## `camera/intrinsics.json`
+## `camera/intrinsics.json` **[planned]**
 
-```json
+```
 {
   "schema": "bildfang-capture/v1-intrinsics",
   "model": "pinhole",
@@ -192,27 +208,31 @@ chosen for tooling ergonomics at this size).
     "fx": 321.4, "fy": 321.7,
     "cx": 320.0, "cy": 240.0
   },
-  "distortion": [0.01, -0.02, 0.0001, -0.0001, 0.0],
-  "video": {
-    "width": 3840, "height": 2160,
-    "fx": 1928.4, "fy": 1930.5,
-    "cx": 1920.0, "cy": 1080.0,
-    "note": "ARCore intrinsics scaled from the ARCore image size to the video resolution; valid while the same physical camera is used"
-  },
   "camera_id": "back"
 }
 ```
 
-- ARCore reports intrinsics for **its own image size**, not the video
-  encoder's resolution — the `video` block is the scaled version, which is
-  what image-based pipelines (COLMAP, VGGT, splatting) need.
-- `distortion` uses ARCore's 5-coefficient model (k1, k2, p1, p2, k3).
-  If ARCore reports none for a device, the field is `null`.
+- ARCore's `CameraIntrinsics` API exposes **only** width, height, fx, fy,
+  cx, cy — for the ARCore image size. It exposes **no distortion
+  coefficients** (there is no 5-coefficient k1/k2/p1/p2/k3 getter on the
+  ARCore intrinsics API; radial/tangential distortion data lives in
+  Camera2 metadata and is not available through the ARCore camera object
+  on the tested fleet devices). If a future build captures Camera2-
+  metadata distortion, it goes into `camera/frames.json` alongside the
+  other per-frame metadata, never into a fabricated field.
+- The earlier draft of this section showed a `video` block with
+  "ARCore intrinsics **scaled** from the ARCore image size to the video
+  resolution". **That claim is wrong and has been removed**: scaling is
+  invalid whenever the encoded mapping rotates or translates the source
+  image (which it does on both fleet devices). The correct encoded-image
+  geometry is the affine chain in `session.json` →
+  `video.encoded_image.mapping`, with a derived rectilinear K only when
+  mathematically valid (see below).
 - If the session used multiple cameras (zoom switch), `camera_id` and the
   intrinsics block repeat per camera; v0.1 captures with a single fixed
   camera per session.
 
-## `imu/imu.csv`
+## `imu/imu.csv` **[planned — P8, not captured by current builds]**
 
 ```
 timestamp_ns,ax,ay,az,gx,gy,gz
@@ -256,9 +276,14 @@ timestamp_ns,ax,ay,az,gx,gy,gz
   }
   ```
 
-  Presentation timestamps are written explicitly to the muxer (no
-  free-running encoder clock), so video ↔ pose ↔ IMU alignment is derived from the measured domain relationships
-  above, not estimated per frame.
+  **Timestamp semantics (current MediaCodec/EGL10 path):** the MP4
+  container PTS is **driver-assigned** — the javax EGL binding has no
+  `eglPresentationTimeANDROID`, so the app cannot write per-frame
+  presentation times into the container. The `presentation_ns` values in
+  this file are the **authoritative** per-frame timestamps, derived from
+  the camera clock (`androidCameraTimestamp − origin`); the container PTS
+  is measured against them (bounded, index-aligned residual — see
+  `tools/inspect_capture.py`), never assumed equal.
 
 ## `metadata/device.json`
 
@@ -293,12 +318,13 @@ kept at model level (the capture stays portable and non-identifying).
 
 ## Interruptions & invariants
 
-- **Device sleep:** if the device suspends mid-capture, `android_monotonic`
-  (and the sensor timestamps on it) stops, while `wall_clock` continues.
-  The app marks the gap in `manifest.json` (`interruptions: [{
-  "from_ns": …, "to_ns": …, "reason": "sleep" }]`) and continues poses in
-  the same segment (no world reset). Consumers must not assume
-  `t(n+1) - t(n)` is bounded in any domain.
+- **Device sleep:** if the device suspends mid-capture, sensor *samples*
+  stop (the sensors are suspended) while the `android_monotonic` clock
+  value **keeps counting** (it does not pause during sleep; only
+  `uptimeNanos()` pauses). Gaps therefore appear in the data streams,
+  not in the clock. The app marks gaps in the session summary and
+  continues poses in the same segment (no world reset). Consumers must
+  not assume `t(n+1) - t(n)` is bounded in any domain.
 - **Stop** writes files in this order: imu → poses → frames/video-index →
   intrinsics → device → manifest (manifest last = completeness marker).
 - **Invariants consumers may rely on:**
@@ -312,7 +338,7 @@ kept at model level (the capture stays portable and non-identifying).
      values; derived values are computed only from documented anchors;
   5. the manifest lists every file with size + sha256.
 
-## `session.json` — what build 0.3.0 actually writes (v1, 2026-09-02)
+## `session.json` — what build 0.3.x actually writes (v1, 2026-09-02)
 
 Build 0.3.0 (the first build of the geometry-frozen recorder) writes the
 following `session.json` fields in addition to the sections above. All
@@ -379,21 +405,31 @@ camera ray  = K_src⁻¹ · [p_src, 1]      (ARCore camera frame)
 world pose  = ARCore device pose at the frame's camera timestamp
 ```
 
-A rectilinear intrinsic matrix for the encoded image **exists only when M
-is diagonal** (pure per-axis scale/flip):
+A rectilinear (zero-skew) intrinsic matrix for the encoded image **exists
+for every 0/90/180/270-degree axis permutation** of the source image with
+independent scale and translation — those are ordinary pinhole images in
+encoded pixel coordinates:
 
 ```
-fx_e = fx_s / m00      fy_e = fy_s / m11
-cx_e = cx_s − tx/m00   cy_e = cy_s − ty/m11
+diagonal M (0°/180°):          anti-diagonal M (90°/270°): axes swap
+  fx_e = fx_s / |m00|            fx_e = fy_s / |m10|
+  fy_e = fy_s / |m11|            fy_e = fx_s / |m01|
+  cx_e = (cx_s − tx) / m00       cx_e = (cy_s − ty) / m10
+  cy_e = (cy_s − ty) / m11       cy_e = (cx_s − tx) / m01
 ```
 
-On the fleet devices (9 Pro, Pixel 6) the sensor is rotated −90° relative
-to the portrait display, so M contains a rotation and **no rectilinear K
-exists for the encoded image**. `rectilinear_model` then carries an
-explicit `ABSENT`/`REFUSED` status instead of a number — consumers must
-use the affine chain above, never a guessed/scaled K. Scaling ARCore
-intrinsics by the dimension ratio is *wrong* whenever the mapping rotates
-or translates, and is what invalidated the 2026-09-01 washroom video
+`rectilinear_model` in `session.json` carries the derived K plus the
+rotation (fleet devices: **270°**, i.e. `texture_rotation_deg = −90`),
+and the affine chain above remains the canonical description. `ABSENT`
+is emitted **only for genuine shear / non-orthogonal** mappings, and
+`REFUSED` when the mapping is non-affine or no texture intrinsics exist —
+never a guessed/scaled K. (A 0.3.0 build predating the orthogonal-K fix
+emitted a conservative `ABSENT (rotation/shear…)` for the fleet's 90°
+cases; those sessions remain fully usable through the affine chain.)
+
+Scaling ARCore intrinsics by the dimension ratio is *wrong* whenever the
+mapping rotates, translates, or anisotropically scales — and a wrong
+viewport/UV mapping is what invalidated the 2026-09-01 washroom video
 (see ROADMAP P1.1).
 
 **Validity of the 2026-09-01 washroom capture

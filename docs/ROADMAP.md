@@ -35,8 +35,8 @@ filter, discard, or silently alter the preserved raw capture.
 | Phase | Title | Status | Notes |
 |-------|-------|--------|-------|
 | P0 | Freeze preview baseline | **DONE** | `8674383` verified on Pixel 7 / GrapheneOS 17 / ARCore 1.54 (2026-09-01) |
-| P1 | First end-to-end capture | **IN PROGRESS — geometry fix shipped 2026-09-02, Step-9 human capture pending** | MediaCodec self-encode path verified on both fleet Pixels (2026-09-01). **2026-09-02: the washroom capture's video geometry was found to be wrong** (encoder GL viewport not updated on the encoder-surface switch + preview UVs rendered into the wrong encoder canvas → camera content on the left, flat fill on the right). It is **INVALID for photometric benchmark, VALID for trajectory analysis with caveats**. P1.1 below fixes the geometry, orientation, intrinsics, metadata, and storage; the 10–20 s human verification capture (Step 9) is the remaining P1 gate. |
-| P1.1 | Recorder geometry / orientation / intrinsics / metadata / storage (2026-09-02) | **BUILT + headless-verified 2026-09-02; human Step-9 capture pending** | See the P1.1 section below. Headless 4 s acceptance capture on the 9 Pro: 906×1406 portrait encoder canvas (was 1920×1080 landscape), orientation frozen at START, affine encoded→source mapping persisted, honest rectilinear refusal (−90° texture rotation → no rectilinear K exists), 7/7 camera-metadata keys with values, EIS explicitly OFF, counter invariants exact, border scan 100% active on all sampled frames (bug signature gone). |
+| P1 | First end-to-end capture | **9 Pro DONE 2026-09-02; Pixel 6 pending re-verify with the 0.3.x build** | P1.1 fixed the recorder geometry (viewport bug that invalidated the washroom video); human Step-9 sweeps verified 100 % tracking + full-frame portrait video on the 9 Pro, validator passes end-to-end. The Pixel 6 (`pixel-7`) still runs the pre-fix build — same code, different HAL, so it gets its own headless + human verification when its adb port card is read. Next: BF-T01…T05 ladder, then the deferred reconstruction pipeline (washroom dataset remains INVALID for photometric use). |
+| P1.1 | Recorder geometry / orientation / intrinsics / metadata / storage (2026-09-02) | **DONE — Step 9 passed 2026-09-02 (human sweeps 100 % tracking, border scan 100 %; orthogonal-K build headless-verified: rectilinear K present with 270° rotation, 7/7 metadata keys, EIS OFF, exact counters)** | See the P1.1 section below. |
 | P2a | MediaCodec timestamp/mux round-trip | **ON-DEVICE VERIFIED on both fleet devices, 2026-09-01** | Full encoder pipeline works on both Exynos devices after fixing: (1) three MediaCodec API bugs (missing `CONFIGURE_FLAG_ENCODE`, `createEncoderByType()` given a codec name, no `COLOR_FormatSurface` — the "GrapheneOS encoder lockdown" diagnosis is **REJECTED**: stock camera records on both devices); (2) on this device/driver, our android-`EGL14` encoder-surface path returned no usable config (even the loosest request; a NULL-list query was rejected outright, `err=0x3000`) — **observed platform/path incompatibility on the tested Pixel 9 Pro / GrapheneOS 17 build**, full driver root cause not yet established — worked around by capturing the javax `EGL10` instance GLSurfaceView itself uses (via the window-surface factory) and driving the encoder surface through it; the driver also rejects custom *context* factories and sentinel indices in `releaseOutputBuffer` (the format-change event must simply be skipped); (3) submit-rate overflow: the encoder input queue holds a few buffers, so 60 fps submissions die after ~3 s — submissions are throttled to the encoder rate (skips counted as drops, never silent); (4) `String.format` without `Locale.US` wrote decimal commas into `poses.json` (de-AT device locale) — invalid JSON. **Tech debt (not pre-P1):** hand-rolled JSON serialization should eventually move to a real serializer (`kotlinx.serialization` or equivalent) so device locale can never touch machine-readable output again. **Container PTS is driver-assigned** on this path (no javax binding for `eglPresentationTimeANDROID`): p50 14.7 ms / p95 30.1 ms / max 54.3 ms residual vs the app's camera-clock PTS, bounded and index-aligned — `frames.json` + persisted origin remain the authoritative timestamp source (by design). | camera ts → normalized PTS → encoder PTS → MP4 PTS → ffprobe; quantify residual. Unblocks P1. |
 | P2b | ARCore native custom-track playback round-trip | **dead end on this fleet (2026-09-01)** | both Pixels: ARCore 1.54 native recorder fatal; see verdict below |
 | P3 | Clock-domain model | **DONE** | `capture-format.md` rewritten: named domains (arcore_frame / android_camera / android_monotonic / wall_clock / sensor / container_pts), guaranteed/measured/unknown, no epoch claims; `frame_timestamp_raw_ns` stored per pose |
@@ -299,15 +299,18 @@ from ARCore, not from the video).
    intrinsics. Persisted as `video.encoded_image.mapping.affine_enc_to_src`
    (6-coefficient 2-D affine, top-left pixel origin).
 4. **Encoded-image intrinsics, honestly** — a rectilinear K for the encoded
-   image exists *only* when the affine is a pure per-axis scale/flip
-   (diagonal linear part). For the fleet devices the sensor is rotated
-   −90° relative to the portrait display, so **no rectilinear K exists**;
-   the canonical model is the chain
-   `encoded px → affine → source px → K_src⁻¹ → camera ray → ARCore pose`.
-   `session.json` records this refusal explicitly (never a guessed K).
-   The measured texture rotation is persisted (`texture_rotation_deg`,
-   derived from the fitted affine — ARCore 1.54's `Camera` exposes no
-   sensor-orientation getter).
+   image exists for **every 0/90/180/270° axis permutation** (rotation +
+   scale + translation — for 90/270 the focal lengths swap axes and the
+   principal point is carried through). The affine chain
+   `encoded px → affine → source px → K_src⁻¹ → camera ray → ARCore pose`
+   stays the canonical description; `session.json` carries the derived K
+   plus the rotation (fleet devices: 270°, i.e. `texture_rotation_deg =
+   −90`) and emits **ABSENT only for genuine shear** or REFUSED when the
+   mapping is non-affine — never a guessed/scaled K. (A pre-fix 0.3.0
+   build emitted a conservative ABSENT for the fleet's 90° mapping; its
+   sessions remain fully usable through the affine chain.) The measured
+   texture rotation is derived from the fitted affine — ARCore 1.54's
+   `Camera` exposes no sensor-orientation getter.
 5. **Camera metadata** — per-frame `Frame.getImageMetadata()` (Camera2-
    derived in ARCore 1.54): exposure time, sensitivity, frame duration,
    rolling-shutter skew, video/OIS stabilization mode, scaler crop region.
@@ -347,12 +350,19 @@ stab mode 0 = off, OIS mode, crop region); counter invariant exact
 Unit tests: `SessionGeometryTest` (affine fit, 90° case, rectilinear
 exact/refuse) and `CameraMetaJsonTest` — 25 tests, all green.
 
-**Remaining P1 gate — Step 9 (human, 10–20 s):** a short walk capture by
-the user in a normal room: the video must fill the frame in portrait,
-show no flat/grey area, and `inspect_capture.py` must pass including the
-border scan and (with the phone actually moving) the tracking-coverage
-check. Only after that: BF-T01/T02 short-pipeline tests, then the
-reconstruction work that has been deferred since the bug was found.
+**Step 9 (human verification) — PASSED 2026-09-02.** The user recorded two
+sweep captures on the 9 Pro (`capture-20260902T220620-774eeb6`, 4 s, and
+`…220626-61ab96dc`, 6 s): both pass the full validator — **100 % tracking
+coverage** (238/238 and 356/356), counter invariants exact, affine chain
+persisted, texture rotation −90°, 7/7 metadata keys, border scan 100 %
+active on all sampled frames, zero discontinuities. A subsequent headless
+run with the orthogonal-K build (`…221256-4bbced47`) additionally shows
+the derived rectilinear K in `session.json` (9 Pro: fx 1168.16 / fy
+1165.93 / cx 453.82 / cy 708.95, rotation 270) — exactly matching the
+validator's independent recomputation from the affine + source K. The
+capture path is proven; the deferred reconstruction work may resume via
+the ladder below (note: the two sweeps are short — BF-T03's 30 s walk is
+the next meaningful trajectory for the pipeline).
 
 **BF-T01…T05 standard test ladder (permanent regression, shortest first):**
 

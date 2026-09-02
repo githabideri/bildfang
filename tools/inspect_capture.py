@@ -340,6 +340,7 @@ def main():
     tr = [_xyz(p["translation"]) for p in tracking]
     if len(tr) >= 2:
         max_speed, max_ang = 0.0, 0.0
+        ang_rates = []
         jumps = 0
         for a, b in zip(poses, poses[1:]):
             dt = (_ft(b) - _ft(a)) / 1e9
@@ -347,14 +348,20 @@ def main():
                 continue
             d = math.dist(_xyz(a["translation"]), _xyz(b["translation"]))
             max_speed = max(max_speed, d / dt)
-            dq = quat_dist(_rot(a), _rot(b))
-            max_ang = max(max_ang, math.degrees(dq) / dt)
+            if a["tracking_state"] == "TRACKING" and b["tracking_state"] == "TRACKING":
+                dq = quat_dist(_rot(a), _rot(b))
+                rate = math.degrees(dq) / dt
+                ang_rates.append(rate)
+                max_ang = max(max_ang, rate)
             if d > 2.0 and dt < 1.0:
                 jumps += 1
-        note(f"max speed {max_speed:.2f} m/s, max angular rate {max_ang:.0f} °/s, "
-             f"jumps>2m<1s: {jumps}")
+        # verdict on p99 (tracked-to-tracked): a single-frame pause-boundary
+        # spike on an otherwise static device must not fail the session
+        p99 = sorted(ang_rates)[max(0, int(0.99 * len(ang_rates)) - 1)] if ang_rates else 0.0
+        note(f"max speed {max_speed:.2f} m/s, angular rate p99 {p99:.0f} / max {max_ang:.0f} °/s "
+             f"(tracked-to-tracked), jumps>2m<1s: {jumps}")
         check("max speed plausible (< 5 m/s)", max_speed < 5, f"{max_speed:.2f} m/s")
-        check("max angular rate plausible (< 900 °/s)", max_ang < 900, f"{max_ang:.0f} °/s")
+        check("p99 angular rate plausible (< 900 °/s)", p99 < 900, f"p99 {p99:.0f} / max {max_ang:.0f} °/s")
         check("no trajectory discontinuities", jumps == 0, f"{jumps}")
         bbox = [[min(c) for c in zip(*tr)], [max(c) for c in zip(*tr)]]
         extent = [b2 - b1 for b1, b2 in zip(bbox[0], bbox[1])]
@@ -446,23 +453,40 @@ def geometry_section(session_dir: Path, sess: dict, vs) -> None:
     check("mapping present with 6 affine coefficients", len(aff) == 6, f"{len(aff)}")
     rect = enc.get("rectilinear_model")
     if len(aff) == 6:
-        diagonal = abs(aff[1]) < 1e-3 and abs(aff[3]) < 1e-3
-        if diagonal:
-            ok = isinstance(rect, dict) and "fx" in rect
-            check("diagonal affine -> rectilinear model present", ok, str(rect)[:80])
-            if ok and src:
-                # fx_e = fx_s / m00, ... (SessionGeometry.tryExactRectilinear)
-                fx_e = float(src["fx"]) / aff[0]
-                fy_e = float(src["fy"]) / aff[4]
-                cx_e = float(src["cx"]) - aff[2] / aff[0]
-                cy_e = float(src["cy"]) - aff[5] / aff[4]
-                ok2 = (abs(rect["fx"] - fx_e) < 0.01 and abs(rect["fy"] - fy_e) < 0.01
-                       and abs(rect["cx"] - cx_e) < 0.01 and abs(rect["cy"] - cy_e) < 0.01)
-                check("rectilinear K consistent with affine + source K", ok2,
-                      f"rect fx={rect['fx']:.3f}/exp {fx_e:.3f}, cy={rect['cy']:.3f}/exp {cy_e:.3f}")
+        scale = max(abs(aff[0]), abs(aff[1]), abs(aff[3]), abs(aff[4]), 1e-9)
+        off = lambda x: abs(x) <= 1e-3 * scale
+        m00, m01, tx = aff[0], aff[1], aff[2]
+        m10, m11, ty = aff[3], aff[4], aff[5]
+        diagonal = off(m01) and off(m10) and abs(m00) > 1e-9 and abs(m11) > 1e-9
+        anti = off(m00) and off(m11) and abs(m01) > 1e-9 and abs(m10) > 1e-9
+        if diagonal or anti:
+            if diagonal:
+                fx_e = float(src["fx"]) / abs(m00)
+                fy_e = float(src["fy"]) / abs(m11)
+                cx_e = (float(src["cx"]) - tx) / m00
+                cy_e = (float(src["cy"]) - ty) / m11
+            else:
+                fx_e = float(src["fy"]) / abs(m10)
+                fy_e = float(src["fx"]) / abs(m01)
+                cx_e = (float(src["cy"]) - ty) / m10
+                cy_e = (float(src["cx"]) - tx) / m01
+            if isinstance(rect, dict) and "fx" in rect:
+                tol = max(0.05, 1e-4 * max(fx_e, fy_e))
+                ok2 = (abs(rect["fx"] - fx_e) < tol and abs(rect["fy"] - fy_e) < tol
+                       and abs(rect["cx"] - cx_e) < tol and abs(rect["cy"] - cy_e) < tol)
+                check("orthogonal mapping -> rectilinear K present and consistent", ok2,
+                      f"rect fx={rect.get('fx'):.3f}/exp {fx_e:.3f} fy={rect.get('fy'):.3f}/exp {fy_e:.3f} "
+                      f"cx={rect.get('cx'):.1f}/exp {cx_e:.1f} cy={rect.get('cy'):.1f}/exp {cy_e:.1f} rot={rect.get('rotation')}")
+            elif isinstance(rect, dict) and "rotation/shear" in rect.get("status", ""):
+                # builds before the orthogonal-K fix rejected 90-degree maps
+                # conservatively; the affine chain is still canonical and exact.
+                note(f"conservative ABSENT from pre-fix build (affine is canonical) — expected K: "
+                     f"fx={fx_e:.3f} fy={fy_e:.3f} cx={cx_e:.1f} cy={cy_e:.1f}")
+            else:
+                check("orthogonal mapping -> rectilinear K present", False, str(rect)[:80])
         else:
             ok = isinstance(rect, dict) and rect.get("status", "").startswith("ABSENT")
-            check("rotated affine -> no rectilinear model (honest ABSENT)", ok, str(rect)[:80])
+            check("sheared/non-orthogonal affine -> no rectilinear model (honest ABSENT)", ok, str(rect)[:80])
     tr = v.get("texture_rotation_deg")
     if tr is not None:
         check("texture rotation is a 90-degree multiple", tr % 90 == 0, str(tr))

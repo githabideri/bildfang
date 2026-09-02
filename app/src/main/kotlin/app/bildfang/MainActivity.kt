@@ -1058,12 +1058,13 @@ class MainActivity : Activity() {
         val affineJson = encAffine?.let {
             "[" + it.joinToString(", ") { String.format(Locale.US, "%.6f", it) } + "]"
         } ?: "null"
+        val rectRot = encAffine?.let { GeometryMath.mappingRotationDeg(it) } ?: -1
         val rectJson = when {
             encRectilinear != null -> String.format(Locale.US,
-                "{\"fx\": %.3f, \"fy\": %.3f, \"cx\": %.3f, \"cy\": %.3f, \"status\": \"EXACT (mapping is a pure per-axis scale/flip)\", \"note\": \"valid only for the encoded pixel grid; the mapping chain above is the canonical geometry\"}",
-                encRectilinear!!.fx, encRectilinear!!.fy, encRectilinear!!.cx, encRectilinear!!.cy)
+                "{\"fx\": %.3f, \"fy\": %.3f, \"cx\": %.3f, \"cy\": %.3f, \"rotation\": %d, \"status\": \"EXACT (orthogonal mapping: %d° rotation + scale + translation)\", \"note\": \"valid only for the encoded pixel grid; the mapping chain above is the canonical geometry\"}",
+                encRectilinear!!.fx, encRectilinear!!.fy, encRectilinear!!.cx, encRectilinear!!.cy, rectRot, rectRot)
             encModelRefused -> "\"REFUSED (mapping non-affine or intrinsics unavailable; do not guess)\""
-            else -> "{\"status\": \"ABSENT (mapping contains rotation/shear; a rectilinear K does not exist for the encoded image — use the mapping chain with source intrinsics and the ARCore camera pose)\"}"
+            else -> "{\"status\": \"ABSENT (mapping contains shear / non-orthogonal components; a rectilinear K does not exist for the encoded image — use the mapping chain with source intrinsics and the ARCore camera pose)\"}"
         }
         val avail = CameraMetaJson.availabilityOf(camMetaRecords)
         val availJson = avail.entries.joinToString(", ") { "\"${it.key}\": \"${it.value}\"" }
@@ -1381,13 +1382,14 @@ class MainActivity : Activity() {
             if (texK == null) encModelRefused = true
             null
         }
+        val frozenRot = encAffine?.let { GeometryMath.mappingRotationDeg(it) } ?: -1
         android.util.Log.i("bildfang", String.format(Locale.US,
             "FROZEN GEOMETRY: %s display=%dx%d enc=%dx%d sensor=%ddeg srcTex=%s affine=[%s] rectilinear=%s",
             sessionGeom!!.orientation, sessionGeom!!.previewWidth, sessionGeom!!.previewHeight,
             sessionGeom!!.encoderWidth, sessionGeom!!.encoderHeight, lastSensorOrientation,
             texK?.let { "${it.width}x${it.height}" } ?: "n/a",
             encAffine?.joinToString(", ") { String.format(Locale.US, "%.6f", it) } ?: "null",
-            if (encRectilinear != null) "EXACT" else "ABSENT (rotation/shear: use mapping chain)"))
+            if (encRectilinear != null) "EXACT (rot ${frozenRot}deg)" else "ABSENT (shear: use mapping chain)"))
     }
 
     /**
