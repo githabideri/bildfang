@@ -56,5 +56,7 @@ dependencies {
     // (verified against the official samples, Apr 2026). The Java package
     // remains `com.google.ar.core.*`.
     implementation("com.google.ar:core:1.54.0")
+    // P1.1: SAF (Storage Access Framework) session storage + browser.
+    implementation("androidx.documentfile:documentfile:1.0.1")
     testImplementation("junit:junit:4.13.2")
 }

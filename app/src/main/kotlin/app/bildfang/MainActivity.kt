@@ -2,11 +2,15 @@ package app.bildfang
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
+import android.content.Intent
+import android.net.Uri
 import android.view.Display
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.os.SystemClock
 import android.opengl.EGL14
+import androidx.documentfile.provider.DocumentFile
 import javax.microedition.khronos.egl.EGL10 as JEGL10
 import javax.microedition.khronos.egl.EGLConfig as JConfig
 import javax.microedition.khronos.egl.EGLContext as JContext
@@ -20,6 +24,7 @@ import com.google.ar.core.ArCoreApk
 import com.google.ar.core.Camera
 import com.google.ar.core.Config
 import com.google.ar.core.Frame
+import com.google.ar.core.ImageMetadata
 import com.google.ar.core.Session
 import android.opengl.GLES20
 import java.io.File
@@ -39,6 +44,7 @@ import javax.microedition.khronos.opengles.GL10
 import kotlin.concurrent.Volatile
 import kotlin.math.max
 import kotlin.math.sqrt
+import kotlin.math.roundToInt
 
 /**
  * Phase-2 UI + capture loop.
@@ -97,6 +103,46 @@ class MainActivity : Activity() {
     private var camImageSize: Size? = null
     private var camFpsRange = ""
 
+    // ---- P1.1 (2026-09-02): geometry frozen at START (orientation policy) ----
+    private var sessionGeom: SessionGeometry? = null
+    // The GL surface dimensions at the moment the geometry is frozen.
+    private var previewSurfW = 0
+    private var previewSurfH = 0
+    private var encW = 0 // encoder canvas = display canvas in the frozen orientation
+    private var encH = 0
+    @Volatile private var geomFrozen = false
+    @Volatile private var uvFreezePending = false // set at START, consumed on the first recording frame
+    @Volatile private var uvFrozen = false
+    private var rotationEventsDuringRec = 0
+    // Snapshot of the preview quad when the geometry froze — the source data
+    // for the encoded->source affine persisted in session.json.
+    private var frozenQuadNdc = floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f)
+    private var frozenQuadTex = floatArrayOf(0f, 1f, 1f, 1f, 0f, 0f, 1f, 0f)
+    private var encAffine: FloatArray? = null // encoded-px -> ARCore-texture-px
+    private var encRectilinear: CameraIntrinsics? = null
+    private var encModelRefused = false
+    private var lastSensorOrientation = 0
+
+    // P1.1 headless acceptance test: `am start -n app.bildfang/.MainActivity
+    // --ei bf_autotest <seconds>` starts a capture once ARCore is tracking
+    // (polling from onResume, ~750 ms cadence) and stops it after <seconds>.
+    // One-shot per process; used for unattended geometry-regression runs.
+    @Volatile private var autotestPending = false
+    @Volatile private var autotestDone = false
+    private var needTracking = false
+    @Volatile private var lastAutotestLogTick = 0L
+    @Volatile private var trackingState = "UNKNOWN" // GL thread -> main thread
+
+    // ---- P1.1 step 5: per-frame camera metadata ----
+    private val camMetaRecords = ArrayList<CameraMetaRecord>()
+    private var camMetaProbeDone = false
+    private var stabilizationConfig = "unknown"
+
+    // ---- P1.1 steps 6-7: storage (SAF) + session browser ----
+    private var storageRootUri: Uri? = null
+    private var storageRootName = "app-external"
+    private var lastBitrate = 0
+
     private val poses = ArrayList<PoseRecord>()
     private val posesLock = Any()
     private var segment = 0
@@ -126,6 +172,8 @@ class MainActivity : Activity() {
     private lateinit var statusView: TextView
     private lateinit var startBtn: Button
     private lateinit var stopBtn: Button
+    private lateinit var sessionsBtn: Button
+    private lateinit var storageBtn: Button
 
     private val random = SecureRandom()
 
@@ -220,19 +268,45 @@ class MainActivity : Activity() {
         }
 
         override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
+            // P1.1: the viewport is explicit per-surface state. The preview
+            // viewport is set here (and restored after every encoder frame);
+            // the encoder sets its own in encodeFrame(). Neither is ever
+            // carried over from the other surface implicitly.
             GLES20.glViewport(0, 0, width, height)
-            // Required before frames flow: ARCore warns "Display geometry
-            // has an invalid width: 0" and the frame manager withholds
-            // frames until the viewport is known (verified on-device
-            // 2026-09-01). NOTE: the argument order is
-            // (rotation, width, height) — rotation is a Surface.ROTATION_x
-            // constant of the *display*, not a pixel dimension.
-            try {
-                val dm = glView.context.getSystemService(android.hardware.display.DisplayManager::class.java)
-                val rotation = dm.getDisplay(Display.DEFAULT_DISPLAY).rotation
-                session?.setDisplayGeometry(rotation, width, height)
-            } catch (e: Exception) {
-                android.util.Log.w("bildfang", "setDisplayGeometry: $e")
+            if (previewSurfW != 0 && (width > height) != (previewSurfW > previewSurfH)) {
+                if (geomFrozen) {
+                    // The device was physically rotated while a recording is
+                    // in flight. The capture coordinate system stays frozen
+                    // at START (orientation policy); the event is only
+                    // logged (rotation_events_during_recording). No geometry,
+                    // UV or encoder state is changed here.
+                    rotationEventsDuringRec++
+                    android.util.Log.w("bildfang", String.format(
+                        Locale.US,
+                        "device rotated mid-recording (event #%d): surface now %dx%d; geometry stays frozen at %dx%d (%s)",
+                        rotationEventsDuringRec, width, height,
+                        previewSurfW, previewSurfH, sessionGeom?.orientation?.label ?: "?"))
+                }
+            }
+            previewSurfW = width
+            previewSurfH = height
+            if (!geomFrozen) {
+                // Required before frames flow: ARCore warns "Display
+                // geometry has an invalid width: 0" and the frame manager
+                // withholds frames until the viewport is known (verified
+                // on-device 2026-09-01). NOTE: the argument order is
+                // (rotation, width, height) — rotation is a
+                // Surface.ROTATION_x constant of the *display*, not a
+                // pixel dimension. While the geometry is frozen
+                // (recording), this is NOT called: ARCore display
+                // geometry is part of the frozen session geometry.
+                try {
+                    val dm = glView.context.getSystemService(android.hardware.display.DisplayManager::class.java)
+                    val rotation = dm.getDisplay(Display.DEFAULT_DISPLAY).rotation
+                    session?.setDisplayGeometry(rotation, width, height)
+                } catch (e: Exception) {
+                    android.util.Log.w("bildfang", "setDisplayGeometry: $e")
+                }
             }
         }
         override fun onDrawFrame(gl: GL10?) {
@@ -282,10 +356,28 @@ class MainActivity : Activity() {
                 // )
                 stopRequested = false
                 val rec = recorder
-                runCatching {
-                    encoderEglPair?.let { eglRef?.eglDestroySurface(it.first, it.second) }
+                val pair = encoderEglPair
+                val j = eglRef
+                if (pair != null && j != null) {
+                    // P1.1: make the preview surface explicitly current
+                    // (the encodeFrame guard already restores it, but do
+                    // not rely on that before destroying the encoder
+                    // surface), restore the preview viewport, then destroy.
+                    runCatching {
+                        val prev = j.eglGetCurrentSurface(JEGL10.EGL_DRAW)
+                        if (prev != pair.second) {
+                            j.eglMakeCurrent(pair.first, prev, prev, j.eglGetCurrentContext())
+                        }
+                        GLES20.glViewport(0, 0, previewSurfW, previewSurfH)
+                        j.eglDestroySurface(pair.first, pair.second)
+                    }
                 }
                 encoderEglPair = null
+                // Unfreeze only when the recording is actually over: a new
+                // recording re-freezes its own geometry at its own START.
+                geomFrozen = false
+                uvFrozen = false
+                uvFreezePending = false
                 try {
                     rec?.stop()
                     recording = false
@@ -344,7 +436,11 @@ class MainActivity : Activity() {
             }
             return
         }
-        if (texDirty || frame.hasDisplayGeometryChanged()) {
+        // P1.1: while the session geometry is frozen (recording in flight)
+        // the UV mapping is part of the frozen geometry and is never
+        // updated; before recording it tracks the (mutable) display
+        // geometry as before.
+        if (!uvFrozen && (texDirty || frame.hasDisplayGeometryChanged())) {
             if (tryUpdateQuadUvs(frame)) texDirty = false
         }
         drawQuad(tex)
@@ -367,45 +463,25 @@ class MainActivity : Activity() {
     }
 
     /**
-     * Encodes the just-updated camera frame: borrows the current GL context
-     * on the encoder's window surface, draws the same OES quad, stamps the
-     * session-relative presentation time (P2a: `android_camera - origin`),
-     * swaps, and restores the preview surface. GL thread.
-     */
-    /**
-     * Draws the camera frame into the encoder's EGL window surface and
-     * swaps it, submitting the frame's timestamps to the recorder.
-     *
-     * Runs entirely in the *javax* EGL world (the binding GLSurfaceView
-     * uses, proven to work on the Exynos driver): the android EGL14
-     * chooseConfig path returns zero configs on this device, so the
-     * encoder surface is created via javax EGL10 and driven with
-     * javax makeCurrent/swap. There is no javax binding for
-     * eglPresentationTimeANDROID, so the MP4 container PTS is left to
-     * the driver default — frames.json (camera clock, session origin)
-     * remains the authoritative timestamp mapping.
-     */
-    /**
-     * Draws the camera frame into the encoder's EGL window surface and
-     * swaps it, submitting the frame's timestamps to the recorder.
-     *
-     * Driven through the javax EGL10 implementation (the binding family
-     * the GLSurfaceView preview uses — the android EGL14 binding returns
-     * zero configs on the Exynos driver). No javax binding exists for
-     * eglPresentationTimeANDROID, so the MP4 container PTS is left to
-     * the driver default; frames.json (camera clock + session origin)
-     * remains the authoritative timestamp mapping.
-     */
-    /**
      * Draws the camera frame into the encoder's EGL window surface and
      * swaps it, submitting the frame's timestamps to the recorder.
      *
      * Driven through the captured javax EGL10 instance (the binding
      * family the GLSurfaceView preview uses; the android EGL14 binding
      * returns zero configs on the Exynos driver). No javax binding
-     * exists for eglPresentationTimeANDROID, so the MP4 container PTS
-     * is left to the driver default; frames.json (camera clock +
-     * session origin) remains the authoritative timestamp mapping.
+     * exists for eglPresentationTimeANDROID, so the MP4 container PTS is
+     * left to the driver default; frames.json (camera clock + session
+     * origin) remains the authoritative timestamp mapping.
+     *
+     * P1.1 geometry discipline (fixes the 2026-09-01 washroom-capture
+     * bug): the encoder draw runs with an EXPLICIT glViewport(0, 0,
+     * encW, encH) — the viewport is per-surface state and was
+     * previously never set for the encoder, so the preview's viewport
+     * was used on a differently-sized encoder framebuffer (camera
+     * content on the left, blank on the right). A finally-block then
+     * restores the preview surface AND the preview viewport on every
+     * path, and the restore is verified by reading the viewport back —
+     * a mismatch is a logged error, never a silent leak.
      */
     private fun encodeFrame(f: Frame) {
         val rec = recorder ?: return
@@ -445,21 +521,42 @@ class MainActivity : Activity() {
             rec.dropFrame()
             return
         }
-        val tex = f.cameraTextureName.takeIf { it != 0 } ?: oesTextureId
-        if (tex == 0) {
+        // The viewport belongs to the surface: the encoder canvas is NOT
+        // the preview size (different orientation/aspect), so it must be
+        // set explicitly before drawing into it. This was missing before
+        // P1.1 — the preview's viewport was applied to the encoder
+        // framebuffer, corrupting every encoded frame.
+        GLES20.glViewport(0, 0, encW, encH)
+        var swapOk = false
+        try {
+            val tex = f.cameraTextureName.takeIf { it != 0 } ?: oesTextureId
+            if (tex != 0) {
+                drawQuad(tex)
+                rec.ensureOrigin(camTs)
+                swapOk = j.eglSwapBuffers(pair.first, pair.second)
+            } else {
+                android.util.Log.e("bildfang", "no camera texture for encoder draw")
+            }
+        } finally {
+            // Restore the preview surface AND its viewport on EVERY path.
             j.eglMakeCurrent(pair.first, prev, prev, ctx)
-            rec.dropFrame()
-            return
+            GLES20.glViewport(0, 0, previewSurfW, previewSurfH)
+            // Restore invariant: verify, don't assume. If anything ever
+            // leaves the preview viewport wrong, it is a logged error
+            // here, not a silently corrupted capture later.
+            val vp = IntArray(4)
+            GLES20.glGetIntegerv(GLES20.GL_VIEWPORT, vp, 0)
+            if (vp[0] != 0 || vp[1] != 0 || vp[2] != previewSurfW || vp[3] != previewSurfH) {
+                android.util.Log.e("bildfang", String.format(Locale.US,
+                    "VIEWPORT RESTORE MISMATCH after encoder frame: got [%d %d %d %d], expected [0 0 %d %d]",
+                    vp[0], vp[1], vp[2], vp[3], previewSurfW, previewSurfH))
+            }
         }
-        drawQuad(tex)
-        rec.ensureOrigin(camTs)
-        if (!j.eglSwapBuffers(pair.first, pair.second)) {
+        if (!swapOk) {
             android.util.Log.e("bildfang", "javax eglSwapBuffers(encoder) failed")
-            j.eglMakeCurrent(pair.first, prev, prev, ctx)
             rec.dropFrame()
             return
         }
-        j.eglMakeCurrent(pair.first, prev, prev, ctx)
         lastEncodeCamNs = camTs
         rec.submitFrame(camTs, f.timestamp)
         val pi = synchronized(posesLock) { poses.lastIndex }
@@ -596,6 +693,8 @@ class MainActivity : Activity() {
         statusView = findViewById(R.id.statusView)
         startBtn = findViewById(R.id.startBtn)
         stopBtn = findViewById(R.id.stopBtn)
+        sessionsBtn = findViewById(R.id.sessionsBtn)
+        storageBtn = findViewById(R.id.storageBtn)
 
         glView.setEGLContextClientVersion(2)
         glView.setEGLConfigChooser(8, 8, 8, 8, 16, 0)
@@ -631,6 +730,9 @@ class MainActivity : Activity() {
 
         startBtn.setOnClickListener { startRecording() }
         stopBtn.setOnClickListener { stopRecording() }
+        sessionsBtn.setOnClickListener { showSessionBrowser() }
+        storageBtn.setOnClickListener { pickStorageRoot() }
+        applyStoredSafRoot()
 
         val avail = ArCoreApk.getInstance().checkAvailability(this)
         statusView.text = when (avail) {
@@ -665,6 +767,17 @@ class MainActivity : Activity() {
             if (s.isGeospatialModeSupported(Config.GeospatialMode.DISABLED)) {
                 cfg.setGeospatialMode(Config.GeospatialMode.DISABLED)
             }
+            // P1.1: EIS explicitly OFF (the default is device-dependent and
+            // an unknown stabilization changes image geometry — it must be
+            // known and logged per session). A/B EIS later, as a controlled
+            // experiment, never by accident.
+            if (s.isImageStabilizationModeSupported(Config.ImageStabilizationMode.OFF)) {
+                cfg.setImageStabilizationMode(Config.ImageStabilizationMode.OFF)
+                stabilizationConfig = "EIS OFF (explicitly set, Config.ImageStabilizationMode.OFF)"
+            } else {
+                stabilizationConfig = "EIS OFF not controllable on this device (unsupported); state not forced"
+            }
+            android.util.Log.i("bildfang", "stabilization: $stabilizationConfig")
             s.configure(cfg)
 
             // Highest-resolution CPU image: it becomes the recorded video
@@ -705,6 +818,55 @@ class MainActivity : Activity() {
             pendingTextureRebind = true
         } catch (ignored: Exception) {
             // permission pending or camera busy; GL loop retries
+        }
+        if (!autotestDone) {
+            val secs = intent?.getIntExtra("bf_autotest", 0) ?: 0
+            if (secs > 0) {
+                autotestPending = true
+                needTracking = intent?.getBooleanExtra("bf_autotest_need_tracking", false) ?: false
+                android.util.Log.i("bildfang", "bf_autotest armed: ${secs}s capture " +
+                    "(need_tracking=$needTracking)")
+            }
+        }
+        if (autotestPending && !autotestDone && !recording) {
+            val h = android.os.Handler(mainLooper)
+            val poll = object : Runnable {
+                override fun run() {
+                    if (autotestPending && !autotestDone && !recording) {
+                        // Geometry verification works in PAUSED (tracking not
+                        // established) too — frames still flow. STOPPED means
+                        // the camera is not delivering; never start there.
+                        val stateOk = if (needTracking) {
+                            trackingState == "TRACKING"
+                        } else {
+                            trackingState == "TRACKING" || trackingState == "PAUSED"
+                        }
+                        if (stateOk && !geomFrozen && previewSurfW > 0) {
+                            startRecording()
+                            if (recording) {
+                                autotestDone = true
+                                val secs = intent?.getIntExtra("bf_autotest", 4) ?: 4
+                                android.util.Log.i("bildfang", "bf_autotest: started, stopping in ${secs}s")
+                                h.postDelayed({
+                                    if (recording) stopRecording()
+                                }, (secs * 1000).toLong())
+                            }
+                        } else {
+                            // Diagnostics: why the autotest has not fired yet
+                            // (screen off -> session paused, or scene without
+                            // enough texture for ARCore to establish tracking).
+                            if ((SystemClock.elapsedRealtime() / 5000).toLong() != lastAutotestLogTick) {
+                                lastAutotestLogTick = (SystemClock.elapsedRealtime() / 5000).toLong()
+                                android.util.Log.i("bildfang", "bf_autotest waiting: " +
+                                    "tracking=${trackingState} geomFrozen=$geomFrozen " +
+                                    "surf=${previewSurfW}x${previewSurfH} sessionActive=$sessionActive")
+                            }
+                            h.postDelayed(this, 750)
+                        }
+                    }
+                }
+            }
+            h.postDelayed(poll, 750)
         }
     }
 
@@ -752,12 +914,28 @@ class MainActivity : Activity() {
             statusView.text = "Session not ready"
             return
         }
-        if (oesTextureId == 0) {
-            // GL surface not created yet (rare): the texture must be
-            // generated on the GL thread, not here (no GL context).
+        if (oesTextureId == 0 || previewSurfW <= 0 || previewSurfH <= 0) {
+            // GL surface not created yet (rare): the texture and the
+            // preview dimensions must be generated on the GL thread, not
+            // here (no GL context).
             statusView.text = "Preview not ready yet — try again"
             return
         }
+
+        // P1.1 orientation policy: the capture orientation is chosen by
+        // the device's current orientation and FROZEN now. It cannot
+        // change mid-recording; a physical rotation is only logged.
+        val rot = displayRotation()
+        val orientation = SessionGeometry.orientationForDisplayRotation(rot)
+        // The encoder canvas is the display canvas in that orientation
+        // (same aspect as the preview), so the ARCore UV mapping is
+        // exactly valid for the encoder — no crop re-derivation, no
+        // assumption about ARCore's crop policy.
+        val (ew, eh) = SessionGeometry.encoderDimensions(orientation, previewSurfW, previewSurfH)
+        encW = ew
+        encH = eh
+        val bitrate = ((25_000_000L * ew * eh) / (1920L * 1080L)).toInt()
+        lastBitrate = bitrate
 
         val dir = createSessionDir()
         videoFile = File(dir, "video/camera.mp4")
@@ -773,11 +951,24 @@ class MainActivity : Activity() {
             lastPose = null
             discontinuities.clear()
         }
+        // P1.1: fresh geometry + metadata state for this session.
+        sessionGeom = null
+        encAffine = null
+        encRectilinear = null
+        encModelRefused = false
+        rotationEventsDuringRec = 0
+        lastSensorOrientation = 0
+        camMetaRecords.clear()
+        camMetaProbeDone = false
+        geomFrozen = false
+        uvFrozen = false
+        uvFreezePending = true // consumed on the first recording frame (GL thread)
 
         // P2a: MediaCodec H.264 (surface input) + MediaMuxer — our recorder,
-        // our timestamps, our muxing. 1080p30 / 25 Mbit/s initial experiment
-        // (reconstruction quality > file size; measure, don't assume).
-        val rec = MediaCodecRecorder(1920, 1080, 30, 25_000_000, File(dir, "video"))
+        // our timestamps, our muxing. Bitrate scales with the canvas area
+        // relative to the 1080p/25 Mbit experiment baseline (reconstruction
+        // quality > file size; measure, don't assume).
+        val rec = MediaCodecRecorder(ew, eh, 30, bitrate, File(dir, "video"))
         if (!rec.start()) {
             android.util.Log.e("bildfang", "recorder start failed", Exception(rec.status()))
             statusView.text = "Recording failed: ${rec.status()}"
@@ -826,8 +1017,23 @@ class MainActivity : Activity() {
             poseFile.writeText(PoseJson.build(snapshot))
             File(dir, "poses/discontinuities.json")
                 .writeText(DiscontinuityJson.build(discSnapshot))
+            // P1.1 step 5: per-frame camera metadata (exposure, sensitivity,
+            // rolling-shutter skew, stabilization state, crop region) with
+            // per-key availability verdicts. Written even when empty — the
+            // availability table is then the record of what the device did
+            // NOT report.
+            val availability = CameraMetaJson.availabilityOf(camMetaRecords)
+            File(dir, "camera/frames.json").apply { parentFile?.mkdirs() }
+                .writeText(CameraMetaJson.build(camMetaRecords, availability, stabilizationConfig))
             File(dir, "session.json").writeText(buildSessionJson())
-            statusView.text = "Saved · ${snapshot.size} poses · video + pose track"
+            // P1.1 steps 6/7: if the user picked a SAF folder, the finished
+            // session is mirrored there and the app-private copy is
+            // removed.
+            if (storageRootUri != null) {
+                copySessionToSaf(dir)
+            } else {
+                statusView.text = "Saved · ${snapshot.size} poses · video + pose track"
+            }
         } catch (e: Exception) {
             statusView.text = "Export failed: ${e.message}"
         }
@@ -838,14 +1044,45 @@ class MainActivity : Activity() {
             packageManager.getPackageInfo("com.google.ar.core", 0).versionName ?: "unknown"
         } catch (e: Exception) { "unknown" }
         val v = camImageSize
+        val g = sessionGeom
+        val jn = { d: Double? -> if (d == null) "null" else String.format(Locale.US, "%.3f", d) }
+        val k = { ci: CameraIntrinsics? ->
+            if (ci == null) {
+                "null"
+            } else {
+                String.format(Locale.US,
+                    "{\"width\": %d, \"height\": %d, \"fx\": %.3f, \"fy\": %.3f, \"cx\": %.3f, \"cy\": %.3f}",
+                    ci.width, ci.height, ci.fx, ci.fy, ci.cx, ci.cy)
+            }
+        }
+        val affineJson = encAffine?.let {
+            "[" + it.joinToString(", ") { String.format(Locale.US, "%.6f", it) } + "]"
+        } ?: "null"
+        val rectJson = when {
+            encRectilinear != null -> String.format(Locale.US,
+                "{\"fx\": %.3f, \"fy\": %.3f, \"cx\": %.3f, \"cy\": %.3f, \"status\": \"EXACT (mapping is a pure per-axis scale/flip)\", \"note\": \"valid only for the encoded pixel grid; the mapping chain above is the canonical geometry\"}",
+                encRectilinear!!.fx, encRectilinear!!.fy, encRectilinear!!.cx, encRectilinear!!.cy)
+            encModelRefused -> "\"REFUSED (mapping non-affine or intrinsics unavailable; do not guess)\""
+            else -> "{\"status\": \"ABSENT (mapping contains rotation/shear; a rectilinear K does not exist for the encoded image — use the mapping chain with source intrinsics and the ARCore camera pose)\"}"
+        }
+        val avail = CameraMetaJson.availabilityOf(camMetaRecords)
+        val availJson = avail.entries.joinToString(", ") { "\"${it.key}\": \"${it.value}\"" }
+        // JSON string escaping happens OUTSIDE the raw string below
+        // (a backslash-quote sequence inside a triple-quoted string
+        // would corrupt the literal).
+        val storageRootEsc = storageRootName.replace("\\", "\\\\").replace("\"", "\\\"")
+        val stabEsc = stabilizationConfig.replace("\\", "\\\\").replace("\"", "\\\"")
         return """
             {
               "schema": "bildfang-capture/v1",
               "app": "bildfang",
-              "app_version": "0.2.0",
+              "app_version": "0.3.0",
               "created_utc": "${SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply { timeZone = TimeZone.getTimeZone("UTC") }.format(Date())}",
               "arcore_sdk": "$arcore",
               "device": "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}",
+              "orientation": ${if (g == null) "null" else "\"${g.orientation.label}\""},
+              "orientation_policy": "frozen at START; physical rotation during recording is logged, never applied",
+              "rotation_events_during_recording": ${g?.let { rotationEventsDuringRec } ?: 0},
               "tracking": {
                 "world_frame": "ARCore device tracking, segment 0 first pose = origin",
                 "note": "trajectory estimate, not ground truth"
@@ -853,9 +1090,27 @@ class MainActivity : Activity() {
               "video": {
                 "file": "video/camera.mp4",
                 "producer": "bildfang MediaCodecRecorder (H.264 hardware encoder, surface input, MediaMuxer)",
-                "resolution": "1920x1080",
+                "resolution": "${encW}x${encH}",
                 "fps_nominal": 30,
-                "bitrate_bps": 25000000,
+                "bitrate_bps": $lastBitrate,
+                "orientation": ${if (g == null) "null" else "\"${g.orientation.label}\""},
+                "preview_geometry": ${if (g == null) "null" else String.format(Locale.US, "{\"width\": %d, \"height\": %d, \"display_rotation\": %d}", g.previewWidth, g.previewHeight, g.displayRotationAtStart)},
+                "texture_rotation_deg": ${g?.textureRotationDeg ?: 0},
+                "source_image": ${k(g?.sourceTextureIntrinsics)},
+                "source_image_model": "ARCore Camera.getTextureIntrinsics() at START (the image the OES quad samples)",
+                "source_camera_image": ${k(g?.sourceImageIntrinsics)},
+                "encoded_image": {
+                  "width": ${g?.encoderWidth ?: encW},
+                  "height": ${g?.encoderHeight ?: encH},
+                  "orientation": ${if (g == null) "null" else "\"${g.orientation.label}\""},
+                  "geometry_source": "bildfang-encoder/v1",
+                  "mapping": {
+                    "kind": "2d_affine_to_source_texture",
+                    "affine_enc_to_src": $affineJson,
+                    "convention": "p_src = M p_enc + t (pixels, top-left origin); camera ray in the ARCore camera frame = K_src^-1 [p_src, 1]"
+                  },
+                  "rectilinear_model": $rectJson
+                },
                 "cpu_image_resolution": ${if (v == null) "null" else "\"${v.width}x${v.height}\""},
                 "fps_range": ${if (camFpsRange.isEmpty()) "null" else "\"$camFpsRange\""},
                 "video_timebase": {
@@ -871,6 +1126,16 @@ class MainActivity : Activity() {
                   "frames_dropped": ${recorder?.counters?.framesDropped ?: 0L},
                   "frames_rate_skipped": ${recorder?.counters?.framesRateSkipped ?: 0L}
                 }
+              },
+              "camera_metadata": {
+                "file": "camera/frames.json",
+                "stabilization_config": "$stabEsc",
+                "availability": { $availJson },
+                "note": "per-frame Camera2-derived values via Frame.getImageMetadata() (ARCore 1.54); availability: AVAILABLE_AND_CAPTURED | SUPPORTED_BUT_UNAVAILABLE_ON_DEVICE | NOT_EXPOSED_BY_CURRENT_API"
+              },
+              "storage": {
+                "root": "$storageRootEsc",
+                "sessions_path": "sessions/"
               },
               "frames_file": "video/frames.json",
               "poses_file": "poses/poses.json",
@@ -901,6 +1166,7 @@ class MainActivity : Activity() {
             com.google.ar.core.TrackingState.PAUSED -> "PAUSED"
             com.google.ar.core.TrackingState.STOPPED -> "STOPPED"
         }
+        trackingState = state
 
         if (frame.timestamp != lastDistinctTsNs) {
             lastDistinctTsNs = frame.timestamp
@@ -908,6 +1174,18 @@ class MainActivity : Activity() {
         }
 
         if (recording) {
+            // P1.1: the very first recording frame freezes the session
+            // geometry (orientation, display, encoder, camera models) and
+            // derives the encoded-image mapping. Exactly once, on the GL
+            // thread, before any frame is encoded.
+            if (uvFreezePending) {
+                uvFreezePending = false
+                uvFrozen = true
+                geomFrozen = true
+                if (texDirty) tryUpdateQuadUvs(frame)
+                finalizeFrozenGeometry(frame)
+            }
+            captureCameraMeta(frame)
             val frameTs = frame.timestamp - frameTsAnchor // session-relative ns
             synchronized(posesLock) {
                 // Trajectory discontinuity detection (P5): multiple
@@ -999,6 +1277,334 @@ class MainActivity : Activity() {
         val hex = String.format(Locale.US, "%06x", random.nextInt())
         val base = getExternalFilesDir(null) ?: filesDir
         return File(base, "sessions/capture-$stamp-$hex")
+    }
+
+
+    // ---- P1.1: frozen geometry + encoded-image model ----------------------
+
+    /** Current display rotation (android.view.Surface.ROTATION_*). UI or GL
+     *  thread (DisplayManager is thread-safe). */
+    private fun displayRotation(): Int =
+        glView.context.getSystemService(android.hardware.display.DisplayManager::class.java)
+            .getDisplay(Display.DEFAULT_DISPLAY).rotation
+
+    /**
+     * GL thread. Called exactly once, on the first frame of a recording:
+     * freezes the session geometry (P1.1 orientation policy) and derives
+     * the encoded-image camera model from the actual preview mapping.
+     *
+     *  - `source_image` = ARCore camera texture intrinsics (the image the
+     *    OES quad actually samples);
+     *  - `encoded_image.mapping` = the affine encoded-pixel ->
+     *    source-texture-pixel mapping, derived from the frozen preview
+     *    quad (transformCoordinates2d NDC->UV) composed with the
+     *    canvas/viewport scaling. This is the canonical, exact geometry
+     *    of every encoded frame;
+     *  - `encoded_image.rectilinear_model` = a pinhole K for the encoded
+     *    image ONLY when the affine is a pure per-axis scale/flip (exact);
+     *    otherwise null — never a scaled copy of the source intrinsics.
+     *
+     * If the mapping is not affine (driver-specific nonlinearity > 1 px)
+     * or no texture intrinsics exist, the model is marked REFUSED in
+     * session.json instead of emitting a wrong one.
+     */
+    private fun finalizeFrozenGeometry(frame: Frame) {
+        val cam: Camera = frame.camera
+        val texK: CameraIntrinsics? = try {
+            val ti = cam.textureIntrinsics
+            CameraIntrinsics(
+                ti.imageDimensions[0], ti.imageDimensions[1],
+                ti.focalLength[0].toDouble(), ti.focalLength[1].toDouble(),
+                ti.principalPoint[0].toDouble(), ti.principalPoint[1].toDouble())
+        } catch (e: Exception) {
+            android.util.Log.w("bildfang", "textureIntrinsics unavailable: ${e.message}")
+            null
+        }
+        val imgK: CameraIntrinsics? = try {
+            val ii = cam.imageIntrinsics
+            CameraIntrinsics(
+                ii.imageDimensions[0], ii.imageDimensions[1],
+                ii.focalLength[0].toDouble(), ii.focalLength[1].toDouble(),
+                ii.principalPoint[0].toDouble(), ii.principalPoint[1].toDouble())
+        } catch (e: Exception) {
+            null
+        }
+        // Snapshot the preview quad first: it is the frozen mapping itself,
+        // and the affine fit must exist before SessionGeometry is built (the
+        // measured texture rotation is a field of it).
+        frozenQuadNdc = quadNdc.copyOf()
+        frozenQuadTex = quadTex.copyOf()
+        encAffine = if (texK != null) {
+            try {
+                GeometryMath.encoderToSourceAffine(
+                    frozenQuadNdc, frozenQuadTex,
+                    previewSurfW, previewSurfH,
+                    encW, encH,
+                    texK.width, texK.height)
+            } catch (e: Exception) {
+                android.util.Log.w("bildfang", "encoderToSourceAffine: ${e.message}")
+                null
+            }
+        } else null
+        if (encAffine != null) {
+            val aff = encAffine!!
+            val rawDeg = Math.toDegrees(Math.atan2(aff[3].toDouble(), aff[0].toDouble()))
+            lastSensorOrientation = (rawDeg / 90.0).roundToInt() * 90
+            android.util.Log.i("bildfang", String.format(Locale.US,
+                "texture rotation (measured from affine): %.1f -> snapped %d deg",
+                rawDeg, lastSensorOrientation))
+        }
+        sessionGeom = SessionGeometry(
+            orientation = SessionGeometry.orientationForDisplayRotation(displayRotation()),
+            displayRotationAtStart = displayRotation(),
+            previewWidth = previewSurfW,
+            previewHeight = previewSurfH,
+            encoderWidth = encW,
+            encoderHeight = encH,
+            encoderFps = recorder?.fps ?: 30,
+            textureRotationDeg = lastSensorOrientation,
+            sourceTextureIntrinsics = texK,
+            sourceImageIntrinsics = imgK,
+            stabilization = stabilizationConfig,
+        )
+        encRectilinear = if (texK != null && encAffine != null) {
+            try {
+                GeometryMath.tryExactRectilinear(texK, encAffine!!)?.let {
+                    it.copy(width = sessionGeom!!.encoderWidth, height = sessionGeom!!.encoderHeight)
+                }
+            } catch (e: Exception) {
+                encModelRefused = true
+                android.util.Log.w("bildfang", "rectilinear fit refused: ${e.message}")
+                null
+            }
+        } else {
+            if (texK == null) encModelRefused = true
+            null
+        }
+        android.util.Log.i("bildfang", String.format(Locale.US,
+            "FROZEN GEOMETRY: %s display=%dx%d enc=%dx%d sensor=%ddeg srcTex=%s affine=[%s] rectilinear=%s",
+            sessionGeom!!.orientation, sessionGeom!!.previewWidth, sessionGeom!!.previewHeight,
+            sessionGeom!!.encoderWidth, sessionGeom!!.encoderHeight, lastSensorOrientation,
+            texK?.let { "${it.width}x${it.height}" } ?: "n/a",
+            encAffine?.joinToString(", ") { String.format(Locale.US, "%.6f", it) } ?: "null",
+            if (encRectilinear != null) "EXACT" else "ABSENT (rotation/shear: use mapping chain)"))
+    }
+
+    /**
+     * GL thread. P1.1 step 5: per-frame camera metadata from
+     * Frame.getImageMetadata() (a Camera2Metadata-derived view in ARCore
+     * 1.54). Only what the device/HAL actually reports is stored; the
+     * per-key availability verdicts are derived from the records and
+     * persisted in the camera/frames.json header.
+     */
+    private fun captureCameraMeta(frame: Frame) {
+        val md: ImageMetadata = try {
+            frame.imageMetadata
+        } catch (e: Exception) {
+            if (!camMetaProbeDone) {
+                camMetaProbeDone = true
+                android.util.Log.w("bildfang", "Frame.getImageMetadata(): ${e.javaClass.simpleName} ${e.message}")
+            }
+            return
+        }
+        if (!camMetaProbeDone) {
+            camMetaProbeDone = true
+            val keys = try { md.keys } catch (e: Exception) { null }
+            android.util.Log.i("bildfang", "ImageMetadata: ${keys?.size ?: 0} keys available on this device")
+        }
+        fun ln(key: Int): Long? = try { md.getLong(key) } catch (e: Exception) { null }
+        fun in_(key: Int): Int? = try { md.getInt(key) } catch (e: Exception) { null }
+        fun bn(key: Int): Int? = try { md.getByte(key).toInt() } catch (e: Exception) { null }
+        fun rect(key: Int): IntArray? = try {
+            val a = md.getIntArray(key)
+            if (a == null || a.size < 4) null else intArrayOf(a[0], a[1], a[2], a[3])
+        } catch (e: Exception) { null }
+        camMetaRecords.add(CameraMetaRecord(
+            frame = camMetaRecords.size,
+            androidCameraTimestampNs = frame.androidCameraTimestamp,
+            exposureTimeNs = ln(ImageMetadata.SENSOR_EXPOSURE_TIME),
+            sensitivityIso = in_(ImageMetadata.SENSOR_SENSITIVITY),
+            frameDurationNs = ln(ImageMetadata.SENSOR_FRAME_DURATION),
+            rollingShutterSkewNs = ln(ImageMetadata.SENSOR_ROLLING_SHUTTER_SKEW),
+            videoStabilizationMode = bn(ImageMetadata.CONTROL_VIDEO_STABILIZATION_MODE),
+            opticalStabilizationMode = bn(ImageMetadata.LENS_OPTICAL_STABILIZATION_MODE),
+            cropRegion = rect(ImageMetadata.SCALER_CROP_REGION),
+        ))
+    }
+
+    // ---- P1.1 steps 6-7: storage (SAF) + session browser -------------------
+
+    private fun storagePrefs() = getSharedPreferences("bildfang", MODE_PRIVATE)
+
+    private fun applyStoredSafRoot() {
+        val u = storagePrefs().getString("saf_root_uri", null) ?: return
+        storageRootUri = Uri.parse(u)
+        storageRootName = "saf:$u"
+    }
+
+    private fun pickStorageRoot() {
+        try {
+            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+            }
+            startActivityForResult(intent, 1001)
+        } catch (e: Exception) {
+            statusView.text = "Storage: picker failed (${e.message})"
+        }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == 1001 && resultCode == RESULT_OK) {
+            val u = data?.data
+            if (u == null) {
+                statusView.text = "Storage: no folder selected"
+                return
+            }
+            // The API-34 SDK stubs in our toolchain lack
+            // takePersistableUriPermission, so go through reflection: the
+            // runtime method is present on every real device. If it ever
+            // fails, the root stays valid for this process lifetime and the
+            // user is told re-picking may be needed after an app restart.
+            val persisted = try {
+                val m = Activity::class.java.getMethod(
+                    "takePersistableUriPermission", Uri::class.java, Int::class.javaPrimitiveType)
+                m.invoke(this, u, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+                true
+            } catch (e: Exception) {
+                android.util.Log.w("bildfang", "takePersistableUriPermission: ${e.javaClass.simpleName} ${e.message}")
+                false
+            }
+            if (!persisted) {
+                statusView.text = "Storage set for this run (persistence unavailable — re-pick after restart)"
+            }
+            storageRootUri = u
+            storageRootName = "saf:$u"
+            storagePrefs().edit().putString("saf_root_uri", u.toString()).apply()
+            statusView.text = "Storage root: $u"
+        }
+    }
+
+    /**
+     * After finalization into the app-private session dir, mirrors the
+     * whole session tree into <SAF root>/Bildfang/sessions/<name>/ and,
+     * on confirmed success, removes the app-private copy. MediaMuxer
+     * requires a real file path, so SAF gets the finished files, not the
+     * live stream.
+     */
+    private fun copySessionToSaf(src: File) {
+        val u = storageRootUri ?: return
+        try {
+            val tree = DocumentFile.fromTreeUri(this, u) ?: run {
+                statusView.text = "SAF: cannot open folder tree"
+                return
+            }
+            val bf = tree.findFile("Bildfang") ?: tree.createDirectory("Bildfang") ?: run {
+                statusView.text = "SAF: cannot create Bildfang dir"
+                return
+            }
+            val sesRoot = bf.findFile("sessions") ?: bf.createDirectory("sessions") ?: run {
+                statusView.text = "SAF: cannot create sessions dir"
+                return
+            }
+            val dst = sesRoot.findFile(src.name) ?: sesRoot.createDirectory(src.name) ?: run {
+                statusView.text = "SAF: cannot create session dir"
+                return
+            }
+            var ok = true
+            for (f in src.walkTopDown().filter { it.isFile }.toList()) {
+                val parts = f.relativeTo(src).path.split("/")
+                var d: DocumentFile = dst
+                for (i in 0 until parts.lastIndex) {
+                    val sub = d.findFile(parts[i]) ?: d.createDirectory(parts[i])
+                    if (sub == null) { ok = false; break }
+                    d = sub
+                }
+                if (!ok) break
+                val existing = d.findFile(parts.last())
+                if (existing != null) existing.delete()
+                val target = d.createFile("application/octet-stream", parts.last())
+                if (target == null) { ok = false; break }
+                val out = contentResolver.openOutputStream(target.uri)
+                if (out == null) { ok = false; break }
+                out.use { o -> f.inputStream().use { i2 -> i2.copyTo(o) } }
+            }
+            if (ok) {
+                src.deleteRecursively()
+                statusView.text = "Saved to $u (sessions dir)"
+            } else {
+                statusView.text = "SAF copy FAILED — session kept in app storage"
+            }
+        } catch (e: Exception) {
+            statusView.text = "SAF copy failed (${e.message}) — session kept in app storage"
+        }
+    }
+
+    private fun safSessions(): List<DocumentFile> {
+        val u = storageRootUri ?: return emptyList()
+        return try {
+            val tree = DocumentFile.fromTreeUri(this, u) ?: return emptyList()
+            val bf = tree.findFile("Bildfang") ?: return emptyList()
+            val ses = bf.findFile("sessions") ?: return emptyList()
+            ses.listFiles().filter { it.isDirectory }.toList()
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    private fun dirSize(f: File): Long = f.walkTopDown().filter { it.isFile }.map { it.length() }.sum()
+
+    private fun docSize(d: DocumentFile): Long =
+        d.length() + d.listFiles().filter { it.isDirectory }.map { docSize(it) }.sum()
+
+    private fun showSessionBrowser() {
+        data class Item(val label: String, val bytes: Long, val complete: Boolean, val node: Any)
+        val items = ArrayList<Item>()
+        val apBase = getExternalFilesDir(null) ?: filesDir
+        val apSes = File(apBase, "sessions")
+        if (apSes.isDirectory) {
+            apSes.listFiles()?.filter { it.isDirectory }?.sortedBy { it.name }?.forEach {
+                items.add(Item("app: ${it.name}", dirSize(it), File(it, "session.json").exists(), it))
+            }
+        }
+        safSessions().sortedBy { it.name }.forEach {
+            items.add(Item("saf: ${it.name}", docSize(it), it.findFile("session.json") != null, it))
+        }
+        if (items.isEmpty()) {
+            statusView.text = "No sessions yet"
+            return
+        }
+        val labels = items.map {
+            val mb = it.bytes / 1048576.0
+            String.format(Locale.US, "%s · %.2f MB%s", it.label, mb, if (it.complete) "" else " · INCOMPLETE")
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Sessions")
+            .setItems(labels.toTypedArray()) { _, i ->
+                val item = items[i]
+                AlertDialog.Builder(this)
+                    .setTitle("Delete session?")
+                    .setMessage("${item.label} (${item.bytes / 1048576.0} MB) will be permanently deleted.")
+                    .setPositiveButton("Delete") { _, _ -> deleteSession(item) }
+                    .setNegativeButton("Cancel", null)
+                    .show()
+            }
+            .setNegativeButton("Close", null)
+            .show()
+    }
+
+    private fun deleteSession(item: Any) {
+        try {
+            if (item is java.io.File) {
+                item.deleteRecursively()
+                statusView.text = "Deleted ${item.name} (app)"
+            } else if (item is DocumentFile) {
+                item.delete()
+                statusView.text = "Deleted ${item.name} (SAF)"
+            }
+        } catch (e: Exception) {
+            statusView.text = "Delete failed: ${e.message}"
+        }
     }
 
     private companion object {

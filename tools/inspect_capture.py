@@ -17,7 +17,13 @@ timebase, e.g. 1/11025 -> ~91 us max quantization).
 
 This is intentionally conservative: it reports *relationships* (and
 flagged unknowns), it does not assert clock-domain equivalences.
-"""
+
+For v1.1 sessions (geometry-frozen builds, 2026-09-02) it additionally
+validates the session-orientation lock, the encoded-geometry model
+(affine/rectilinear consistency), the camera-metadata file, and — via
+ffmpeg frame extraction — scans sampled frames for constant image
+borders (the 2026-09-02 "grey right half" encoder-viewport bug
+signature)."""
 
 import json
 import math
@@ -388,7 +394,166 @@ def main():
                 note("spans do not nearly coincide — domains likely differ; "
                      "derive the transform in P3 before any invariant")
 
+    geometry_section(session_dir, sess, vs)
     finish(dur)
+
+
+def geometry_section(session_dir: Path, sess: dict, vs) -> None:
+    """P1.1: orientation lock, encoded-geometry model, metadata, borders.
+
+    All sections are nested under `video` in session.json (v1.1 schema).
+    Pre-1.1 sessions (no orientation/mapping keys) get a note and are
+    skipped — the P1 checks above remain the contract for them.
+    """
+    if "orientation" not in sess or "video" not in sess:
+        note("not a v1.1 session — geometry checks skipped")
+        return
+    print("\ngeometry & encoded intrinsics (v1.1)")
+    v = sess.get("video", {})
+
+    # --- orientation lock ---
+    pol = sess.get("orientation_policy", "")
+    check("orientation locked at start (session field present)",
+          sess.get("orientation") in ("portrait", "landscape"),
+          str(sess.get("orientation")))
+    if pol:
+        check("orientation policy recorded", True, pol)
+    events = sess.get("rotation_events_during_recording")
+    check("no mid-recording rotation events", events == 0, f"{events}")
+    pg = v.get("preview_geometry") or {}
+    if pg:
+        check("preview geometry frozen", pg.get("width", 0) > 0,
+              f"{pg.get('width')}x{pg.get('height')} rot={pg.get('display_rotation')}")
+
+    # --- encoded image + mapping ---
+    enc = v.get("encoded_image") or {}
+    mapping = enc.get("mapping") or {}
+    src = v.get("source_image") or {}
+    ew, eh = int(enc.get("width") or 0), int(enc.get("height") or 0)
+    check("encoded image dims documented", ew > 0 and eh > 0, f"{ew}x{eh}")
+    if vs:
+        vw, vh = int(vs.get("width") or 0), int(vs.get("height") or 0)
+        check("video resolution == documented encoded geometry",
+              (vw, vh) == (ew, eh), f"video {vw}x{vh} vs encoded {ew}x{eh}")
+    check("encoded geometry_source is bildfang-encoder/v1",
+          enc.get("geometry_source") == "bildfang-encoder/v1",
+          str(enc.get("geometry_source")))
+    if src:
+        check("ARCore source intrinsics present",
+              bool(src.get("fx")) and src.get("width", 0) > 0,
+              f"{src.get('width')}x{src.get('height')} fx={src.get('fx')}")
+    aff = mapping.get("affine_enc_to_src") or []
+    check("mapping present with 6 affine coefficients", len(aff) == 6, f"{len(aff)}")
+    rect = enc.get("rectilinear_model")
+    if len(aff) == 6:
+        diagonal = abs(aff[1]) < 1e-3 and abs(aff[3]) < 1e-3
+        if diagonal:
+            ok = isinstance(rect, dict) and "fx" in rect
+            check("diagonal affine -> rectilinear model present", ok, str(rect)[:80])
+            if ok and src:
+                # fx_e = fx_s / m00, ... (SessionGeometry.tryExactRectilinear)
+                fx_e = float(src["fx"]) / aff[0]
+                fy_e = float(src["fy"]) / aff[4]
+                cx_e = float(src["cx"]) - aff[2] / aff[0]
+                cy_e = float(src["cy"]) - aff[5] / aff[4]
+                ok2 = (abs(rect["fx"] - fx_e) < 0.01 and abs(rect["fy"] - fy_e) < 0.01
+                       and abs(rect["cx"] - cx_e) < 0.01 and abs(rect["cy"] - cy_e) < 0.01)
+                check("rectilinear K consistent with affine + source K", ok2,
+                      f"rect fx={rect['fx']:.3f}/exp {fx_e:.3f}, cy={rect['cy']:.3f}/exp {cy_e:.3f}")
+        else:
+            ok = isinstance(rect, dict) and rect.get("status", "").startswith("ABSENT")
+            check("rotated affine -> no rectilinear model (honest ABSENT)", ok, str(rect)[:80])
+    tr = v.get("texture_rotation_deg")
+    if tr is not None:
+        check("texture rotation is a 90-degree multiple", tr % 90 == 0, str(tr))
+
+    # --- camera metadata ---
+    md = sess.get("camera_metadata") or {}
+    if md:
+        mp = session_dir / md.get("file", "camera/frames.json")
+        check("camera metadata file present", mp.is_file())
+        if mp.is_file():
+            data = load_json(mp)
+            recs = data.get("frames", [])
+            av = md.get("availability", {})
+            with_v = sum(1 for x in av.values() if x == "AVAILABLE_AND_CAPTURED")
+            check("metadata availability table populated", len(av) > 0 and with_v > 0,
+                  f"{with_v}/{len(av)} keys with values, {len(recs)} per-frame records")
+            stab = md.get("stabilization_config", "")
+            if stab:
+                note(f"stabilization config: {stab}")
+
+    # --- constant-border scan (the 2026-09-02 viewport-bug detector) ---
+    if not (shutil.which("ffmpeg") and vs):
+        note("ffmpeg not available — constant-border scan skipped")
+        return
+    video_p = session_dir / "video" / "camera.mp4"
+    if not video_p.is_file():
+        legacy = session_dir / "video.mp4"
+        video_p = legacy if legacy.is_file() else video_p
+    import re
+    import tempfile
+    total_f = int(vs.get("nb_frames") or 100)
+    dur_s = sess.get("duration_s") or (total_f / 30.0)
+    times = [max(0.05, (i + 0.5) * float(dur_s) / 9) for i in range(9)]
+    worst_frac = 1.0
+    worst = {"l": 0, "r": 0, "t": 0, "b": 0}
+    scanned = 0
+    with tempfile.TemporaryDirectory() as td:
+        for i, t in enumerate(times):
+            out = Path(td) / f"f{i}.ppm"
+            r = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{t:.2f}",
+                                "-i", str(video_p), "-frames:v", "1",
+                                "-vf", "scale=iw/4:ih/4", str(out)],
+                               capture_output=True, text=True, timeout=60)
+            if r.returncode != 0 or not out.is_file():
+                continue
+            txt = out.read_bytes()
+            m = re.match(rb"P[67]\s+(\d+)\s+(\d+)\s+255", txt)
+            if not m:
+                continue
+            w, h = int(m.group(1)), int(m.group(2))
+            raw = txt[m.end():]
+            if len(raw) < w * h * 3:
+                continue
+            px = [raw[j * 3] + raw[j * 3 + 1] + raw[j * 3 + 2] for j in range(w * h)]
+
+            def rowstd(y):
+                seg = px[y * w:(y + 1) * w]
+                mean = sum(seg) / len(seg)
+                return (sum((x - mean) ** 2 for x in seg) / len(seg)) ** 0.5
+
+            def colstd(x):
+                seg = [px[y * w + x] for y in range(h)]
+                mean = sum(seg) / len(seg)
+                return (sum((v - mean) ** 2 for v in seg) / len(seg)) ** 0.5
+
+            l = 0
+            while l < w * 0.5 and rowstd(l) < 8: l += 1
+            r_ = 0
+            while r_ < w * 0.5 and rowstd(h - 1 - r_) < 8: r_ += 1
+            t_ = 0
+            while t_ < h * 0.5 and colstd(t_) < 8: t_ += 1
+            b_ = 0
+            while b_ < h * 0.5 and colstd(w - 1 - b_) < 8: b_ += 1
+            frac = ((w - l - r_) * (h - t_ - b_)) / (w * h)
+            scanned += 1
+            worst_frac = min(worst_frac, frac)
+            worst["l"] = max(worst["l"], l)
+            worst["r"] = max(worst["r"], r_)
+            worst["t"] = max(worst["t"], t_)
+            worst["b"] = max(worst["b"], b_)
+    if scanned == 0:
+        note("border scan: no frames extractable — skipped")
+        return
+    ok = worst_frac >= 0.9
+    check(f"no constant image borders (scanned {scanned} frames @ 1/4 scale)", ok,
+          f"min active fraction {worst_frac * 100:.1f}% "
+          f"(L{worst['l']} R{worst['r']} T{worst['t']} B{worst['b']} of {int(vs.get('width')) // 4}x{int(vs.get('height')) // 4})")
+    if not ok:
+        note("constant-border scan found large flat regions — classic signature "
+             "of the encoder-viewport bug or a letterboxed source. Do NOT use "
+             "this session for photometric work until inspected visually.")
 
 
 def get_pts_ns(video_p: Path, vs) -> list:
@@ -429,7 +594,7 @@ def finish(dur) -> None:
     if FAILS:
         print(f"\nRESULT: FAIL ({len(FAILS)}): {', '.join(FAILS)}")
         sys.exit(1)
-    print("\nRESULT: OK — session passes P1 validation")
+    print("\nRESULT: OK — session passes P1/P1.1 validation")
 
 
 if __name__ == "__main__":

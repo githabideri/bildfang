@@ -312,6 +312,95 @@ kept at model level (the capture stays portable and non-identifying).
      values; derived values are computed only from documented anchors;
   5. the manifest lists every file with size + sha256.
 
+## `session.json` — what build 0.3.0 actually writes (v1, 2026-09-02)
+
+Build 0.3.0 (the first build of the geometry-frozen recorder) writes the
+following `session.json` fields in addition to the sections above. All
+geometry fields are **frozen at START** of the capture; nothing in this
+schema changes mid-recording.
+
+```
+orientation                      "portrait" | "landscape" — chosen at START,
+                                  frozen for the whole session
+orientation_policy               "frozen at START; physical rotation during
+                                  recording is logged, never applied"
+rotation_events_during_recording int  (display-rotation change events while
+                                  recording; 0 in a compliant capture)
+video.orientation                same as above (the encoded video's)
+video.preview_geometry           {width, height, display_rotation} — the GL
+                                  surface size + display rotation at freeze
+video.texture_rotation_deg       measured rotation (degrees, signed,
+                                  90-multiple) of the ARCore camera texture
+                                  relative to the source image, derived from
+                                  the fitted mapping affine. ARCore 1.54
+                                  exposes no sensor-orientation getter; the
+                                  affine is the measurement.
+video.source_image               {width, height, fx, fy, cx, cy} — ARCore
+                                  Camera.getTextureIntrinsics() at START:
+                                  the image the GL quad samples
+video.source_camera_image        same, from getImageIntrinsics() (raw sensor
+                                  image; equal to source_image on current
+                                  fleet devices)
+video.encoded_image.width/height encoder canvas in the frozen orientation
+                                  (display canvas, even-rounded)
+video.encoded_image.mapping      {kind, affine_enc_to_src[6], convention}
+video.encoded_image.rectilinear_model  see "The encoded-image model" below
+video.video_timebase             {source_clock: "android_camera",
+                                  origin_raw_ns, unit: "ns"}
+video.counters                   {camera_frames_observed, frames_submitted,
+                                  frames_encoded, frames_muxed, frames_dropped,
+                                  frames_rate_skipped}
+camera_metadata.file             "camera/frames.json" (per-frame records)
+camera_metadata.stabilization_config  e.g. "EIS OFF (explicitly set, ...)"
+camera_metadata.availability     per-key three-state table:
+                                  AVAILABLE_AND_CAPTURED |
+                                  SUPPORTED_BUT_UNAVAILABLE_ON_DEVICE |
+                                  NOT_EXPOSED_BY_CURRENT_API
+storage.root / storage.sessions_path  where sessions are written (app-external
+                                  default or a user-picked SAF tree)
+```
+
+**Counter invariants** (checked by `tools/inspect_capture.py`):
+`camera_frames_observed == frames_rate_skipped + frames_dropped +
+frames_submitted`; `frames_submitted >= frames_muxed`; `frames_encoded`
+may exceed `frames_submitted` by at most the encoder drain at stop. `frames_rate_skipped`
+is *deliberate* cadence sampling (source faster than the encoder rate);
+`frames_dropped` is *failure* only. Neither is silent: both are counted
+and persisted.
+
+### The encoded-image model (read this before using the video)
+
+The encoded pixels are related to the ARCore source image by a documented
+2-D affine transform (top-left pixel origin):
+
+```
+p_src = M · p_enc + t        M = [[m00, m01], [m10, m11]], t = [tx, ty]
+camera ray  = K_src⁻¹ · [p_src, 1]      (ARCore camera frame)
+world pose  = ARCore device pose at the frame's camera timestamp
+```
+
+A rectilinear intrinsic matrix for the encoded image **exists only when M
+is diagonal** (pure per-axis scale/flip):
+
+```
+fx_e = fx_s / m00      fy_e = fy_s / m11
+cx_e = cx_s − tx/m00   cy_e = cy_s − ty/m11
+```
+
+On the fleet devices (9 Pro, Pixel 6) the sensor is rotated −90° relative
+to the portrait display, so M contains a rotation and **no rectilinear K
+exists for the encoded image**. `rectilinear_model` then carries an
+explicit `ABSENT`/`REFUSED` status instead of a number — consumers must
+use the affine chain above, never a guessed/scaled K. Scaling ARCore
+intrinsics by the dimension ratio is *wrong* whenever the mapping rotates
+or translates, and is what invalidated the 2026-09-01 washroom video
+(see ROADMAP P1.1).
+
+**Validity of the 2026-09-01 washroom capture
+(`capture-20260901T200005-9dc67864`)**: VALID for ARCore trajectory
+analysis (poses are independent of the video bug); **INVALID for any
+photometric use** — the encoded frames are corrupted (viewport bug).
+
 ## Versioning
 
 `"schema": "bildfang-capture/v1"` — future breaking changes bump the

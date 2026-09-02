@@ -14,4 +14,6 @@
 
     <string name="status_recording">Recording…</string>
     <string name="status_stopped">Capture exported</string>
+    <string name="sessions">SESSIONS</string>
+    <string name="storage">STORAGE</string>
 </resources>

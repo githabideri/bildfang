@@ -19,9 +19,15 @@
              even answer (verified on-device 2026-08-31). -->
         <meta-data android:name="com.google.ar.core" android:value="required" />
 
+        <!-- P1.1 (2026-09-02): the hard portrait lock was removed. The
+             orientation is chosen by the user before START and FROZEN when
+             recording starts (see MainActivity.startRecording / Session
+             Geometry). configChanges keeps the activity (and an in-flight
+             recording) alive across physical rotation: the capture
+             coordinate system stays fixed, the rotation is logged. -->
         <activity
             android:name=".MainActivity"
-            android:screenOrientation="portrait"
+            android:configChanges="orientation|screenSize|smallestScreenSize|keyboardHidden"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

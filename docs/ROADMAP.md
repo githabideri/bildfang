@@ -35,7 +35,8 @@ filter, discard, or silently alter the preserved raw capture.
 | Phase | Title | Status | Notes |
 |-------|-------|--------|-------|
 | P0 | Freeze preview baseline | **DONE** | `8674383` verified on Pixel 7 / GrapheneOS 17 / ARCore 1.54 (2026-09-01) |
-| P1 | First end-to-end capture | **IN PROGRESS — both fleet devices verified 2026-09-01** | ARCore native recorder dead on both fleet Pixels (device bug, bisection below); MediaCodec self-encode is the primary path. **9 Pro (Exynos 2400): 30 s capture, 100 % tracking, all `inspect_capture.py` checks pass** (900 encoded frames, exact counter invariants, 29.97 s camera span == 29.99 s container span, zero discontinuities). **Pixel 6 `pixel-7` (Exynos 2100): 10 s + 30 s captures, all checks pass** (903 frames, 100 % tracking). Remaining: a real 60–90 s room walk + stress + interrupted-capture tests. |
+| P1 | First end-to-end capture | **IN PROGRESS — geometry fix shipped 2026-09-02, Step-9 human capture pending** | MediaCodec self-encode path verified on both fleet Pixels (2026-09-01). **2026-09-02: the washroom capture's video geometry was found to be wrong** (encoder GL viewport not updated on the encoder-surface switch + preview UVs rendered into the wrong encoder canvas → camera content on the left, flat fill on the right). It is **INVALID for photometric benchmark, VALID for trajectory analysis with caveats**. P1.1 below fixes the geometry, orientation, intrinsics, metadata, and storage; the 10–20 s human verification capture (Step 9) is the remaining P1 gate. |
+| P1.1 | Recorder geometry / orientation / intrinsics / metadata / storage (2026-09-02) | **BUILT + headless-verified 2026-09-02; human Step-9 capture pending** | See the P1.1 section below. Headless 4 s acceptance capture on the 9 Pro: 906×1406 portrait encoder canvas (was 1920×1080 landscape), orientation frozen at START, affine encoded→source mapping persisted, honest rectilinear refusal (−90° texture rotation → no rectilinear K exists), 7/7 camera-metadata keys with values, EIS explicitly OFF, counter invariants exact, border scan 100% active on all sampled frames (bug signature gone). |
 | P2a | MediaCodec timestamp/mux round-trip | **ON-DEVICE VERIFIED on both fleet devices, 2026-09-01** | Full encoder pipeline works on both Exynos devices after fixing: (1) three MediaCodec API bugs (missing `CONFIGURE_FLAG_ENCODE`, `createEncoderByType()` given a codec name, no `COLOR_FormatSurface` — the "GrapheneOS encoder lockdown" diagnosis is **REJECTED**: stock camera records on both devices); (2) on this device/driver, our android-`EGL14` encoder-surface path returned no usable config (even the loosest request; a NULL-list query was rejected outright, `err=0x3000`) — **observed platform/path incompatibility on the tested Pixel 9 Pro / GrapheneOS 17 build**, full driver root cause not yet established — worked around by capturing the javax `EGL10` instance GLSurfaceView itself uses (via the window-surface factory) and driving the encoder surface through it; the driver also rejects custom *context* factories and sentinel indices in `releaseOutputBuffer` (the format-change event must simply be skipped); (3) submit-rate overflow: the encoder input queue holds a few buffers, so 60 fps submissions die after ~3 s — submissions are throttled to the encoder rate (skips counted as drops, never silent); (4) `String.format` without `Locale.US` wrote decimal commas into `poses.json` (de-AT device locale) — invalid JSON. **Tech debt (not pre-P1):** hand-rolled JSON serialization should eventually move to a real serializer (`kotlinx.serialization` or equivalent) so device locale can never touch machine-readable output again. **Container PTS is driver-assigned** on this path (no javax binding for `eglPresentationTimeANDROID`): p50 14.7 ms / p95 30.1 ms / max 54.3 ms residual vs the app's camera-clock PTS, bounded and index-aligned — `frames.json` + persisted origin remain the authoritative timestamp source (by design). | camera ts → normalized PTS → encoder PTS → MP4 PTS → ffprobe; quantify residual. Unblocks P1. |
 | P2b | ARCore native custom-track playback round-trip | **dead end on this fleet (2026-09-01)** | both Pixels: ARCore 1.54 native recorder fatal; see verdict below |
 | P3 | Clock-domain model | **DONE** | `capture-format.md` rewritten: named domains (arcore_frame / android_camera / android_monotonic / wall_clock / sensor / container_pts), guaranteed/measured/unknown, no epoch claims; `frame_timestamp_raw_ns` stored per pose |
@@ -263,6 +264,108 @@ preview path works fine under the same seccomp profile.)
 3. **File an upstream bug** (Google ARCore / GrapheneOS) with the bisection
    log above — low priority, but cheap to do once the format is frozen.
 
+
+## P1.1 — Recorder geometry, orientation, intrinsics, metadata, storage (2026-09-02)
+
+**The bug found in the first real spatial capture (washroom, 2026-09-01).**
+The encoded video was not a valid image of the ARCore source frame: the GL
+viewport was still set to the preview dimensions when the encoder surface was
+made current (never updated on the encoder-surface switch), and the preview
+UV quad — computed for the portrait preview display geometry — was rendered
+into a landscape encoder canvas. Result: camera content on the left, flat
+grey/black fill on the right. Every photometric conclusion drawn from that
+capture (sharpness, motion blur as the reconstruction blocker, exposure) is
+**void**; the trajectory analysis remains valid with caveats (the poses come
+from ARCore, not from the video).
+
+**The fix (this phase), implemented 2026-09-02:**
+
+1. **Viewport discipline** — the encoder canvas gets its own
+   `glViewport(0, 0, encW, encH)` before every encoder render; the preview
+   surface and viewport are restored in a `finally` block on *every* exit
+   path (normal, error, early return), with a read-back invariant check
+   logged on mismatch.
+2. **Orientation frozen per session** — the capture orientation is decided
+   at START (portrait → 1080×1920-class canvas, landscape → its transpose),
+   persisted in `session.json`; physical rotation during recording is
+   counted (`rotation_events_during_recording`) but never applied. The
+   activity no longer declares a fixed screen orientation; it owns its
+   geometry. (ARCore display geometry is part of the frozen state —
+   `setDisplayGeometry` is not re-called while frozen.)
+3. **Preview geometry ≠ encoder geometry** — the encoder canvas is the
+   display canvas in the frozen orientation (even dimensions), and the
+   documented transform from ARCore source image → encoded pixels is
+   derived from the actual frozen render quad, not by scaling ARCore
+   intrinsics. Persisted as `video.encoded_image.mapping.affine_enc_to_src`
+   (6-coefficient 2-D affine, top-left pixel origin).
+4. **Encoded-image intrinsics, honestly** — a rectilinear K for the encoded
+   image exists *only* when the affine is a pure per-axis scale/flip
+   (diagonal linear part). For the fleet devices the sensor is rotated
+   −90° relative to the portrait display, so **no rectilinear K exists**;
+   the canonical model is the chain
+   `encoded px → affine → source px → K_src⁻¹ → camera ray → ARCore pose`.
+   `session.json` records this refusal explicitly (never a guessed K).
+   The measured texture rotation is persisted (`texture_rotation_deg`,
+   derived from the fitted affine — ARCore 1.54's `Camera` exposes no
+   sensor-orientation getter).
+5. **Camera metadata** — per-frame `Frame.getImageMetadata()` (Camera2-
+   derived in ARCore 1.54): exposure time, sensitivity, frame duration,
+   rolling-shutter skew, video/OIS stabilization mode, scaler crop region.
+   Only values the HAL actually reports are stored; a per-key availability
+   table (three-state) goes into `camera/frames.json` and the session
+   summary. **EIS is explicitly OFF** for captures (it changes image
+   geometry); an A/B experiment with EIS on is a later, controlled step.
+6. **Storage via SAF** — a user-selectable capture root
+   (`ACTION_OPEN_DOCUMENT_TREE`, persistable permission via reflection —
+   the API-34 SDK stubs in our toolchain lack the method, the runtime has
+   it) with an app-private external fallback until the user picks one.
+   No `MANAGE_EXTERNAL_STORAGE`. Sessions copy to the SAF root at finalize.
+7. **Session browser** — in-app list of sessions (name, size, complete/
+   incomplete) with delete; `SESSIONS` and `STORAGE` buttons in the layout.
+8. **Validator upgrade** (`tools/inspect_capture.py`) — orientation/
+   dimension consistency, mapping/rectilinear consistency (recomputed from
+   the persisted affine + source K), metadata-file checks, and a
+   **constant-border scan** of sampled frames that fails on the
+   flat-fill/grey-side signature of the viewport bug.
+9. **Headless acceptance mode** — `am start -n app.bildfang/.MainActivity
+   --ei bf_autotest <seconds>` (optionally `--ez bf_autotest_need_tracking
+   true`) records a fixed-length capture without any UI input; this is the
+   regression primitive for the BF-T01 ladder below.
+
+**Acceptance results (2026-09-02, Pixel 9 Pro / GrapheneOS 17 / ARCore 1.56,
+headless 4 s):** encoder canvas 906×1406 portrait (matches the display
+surface 906×1407, even-rounded); `texture_rotation_deg = −90` (measured
+from the fitted affine; the 9 Pro texture is 1920×1080 with fx≈1390.8);
+affine `[0, 1.1929, 121.39, −1.1921, 0, 1080.0]` (encoded 906×1406 → a
+1678×1080 region of the 1920×1080 source texture, rotated −90° — the
+aspect difference is the expected portrait crop, not a bug); rectilinear
+model honestly `ABSENT`; 7/7 metadata keys `AVAILABLE_AND_CAPTURED`
+(exposure ≈16.7 ms, ISO ≈1150, duration ≈33.3 ms, skew ≈4.5 ms, video-
+stab mode 0 = off, OIS mode, crop region); counter invariant exact
+(observed 240 = rate-skipped 121 + dropped 0 + submitted 119; encoded 119
+= muxed 119); constant-border scan 100% active on all 9 sampled frames.
+Unit tests: `SessionGeometryTest` (affine fit, 90° case, rectilinear
+exact/refuse) and `CameraMetaJsonTest` — 25 tests, all green.
+
+**Remaining P1 gate — Step 9 (human, 10–20 s):** a short walk capture by
+the user in a normal room: the video must fill the frame in portrait,
+show no flat/grey area, and `inspect_capture.py` must pass including the
+border scan and (with the phone actually moving) the tracking-coverage
+check. Only after that: BF-T01/T02 short-pipeline tests, then the
+reconstruction work that has been deferred since the bug was found.
+
+**BF-T01…T05 standard test ladder (permanent regression, shortest first):**
+
+| Test | Content | Gate |
+|------|---------|------|
+| BF-T01 | 10 s headless static capture (phone on a table, textured background) | border scan, counters, intrinsics, metadata |
+| BF-T02 | 10 s slow pan (hand-held) | + tracking coverage, pose cadence |
+| BF-T03 | 30 s room walk, 3–4 stops | + trajectory continuity, discontinuity report sane |
+| BF-T04 | interrupted capture (stop via force-stop mid-recording) | session marked incomplete, no corrupt MP4, files consistent |
+| BF-T05 | full room (≈ washroom scale) | end-to-end; only after T01–T04 pass; feeds the BF pipeline |
+
+No long reconstruction run (COLMAP/VGGT/MASt3R/GS) is justified until T01–T02
+pass; multiple GPU-hours are only spent after T05.
 
 ## P2a — MediaCodec recorder: architecture, timestamp round-trip (REQUIRED)
 
