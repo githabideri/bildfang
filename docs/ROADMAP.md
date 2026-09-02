@@ -385,7 +385,7 @@ pass; multiple GPU-hours are only spent after T05.
   tracking, 0 discontinuities, 313° total heading change, extent
   1.32×0.71×0.92 m, start→end 0.64 m.
 - `capture-20260902T231925-adba4e76` — **38.2 s walk with corner turns**:
-  2244 poses @ 58.7 Hz, 100 % tracking, 0 discontinuits/relocalizations,
+  2244 poses @ 58.7 Hz, 100 % tracking, 0 discontinuities/relocalizations,
   0 jumps > 0.5 m, 304° total heading change, extent 1.68×1.01×1.10 m,
   start→end displacement 0.40 m, 906×1330 video, 1129 frames, exact
   counters, K_encoded rot 270 consistent, 7/7 metadata keys, border scan
