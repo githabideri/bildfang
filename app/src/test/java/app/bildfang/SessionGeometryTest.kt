@@ -188,6 +188,59 @@ class SessionGeometryTest {
     }
 
     @Test
+    fun `projection round-trip, encoded K plus encoded-camera rotation matches source K plus affine, all four rotations`() {
+        val src = CameraIntrinsics(1920, 1080, 1390.8, 1392.5, 967.1, 539.0)
+        // known 3D points in the ARCore camera frame (x right, y down, z forward)
+        val pts = arrayOf(
+            doubleArrayOf(0.1, 0.05, 2.0),
+            doubleArrayOf(-0.3, 0.2, 1.5),
+            doubleArrayOf(0.0, 0.0, 1.0),
+            doubleArrayOf(0.5, -0.4, 3.0),
+        )
+        for (rot in listOf(0, 90, 180, 270)) {
+            val s = 1.19
+            val a = 1.23  // anisotropic scale, distinct from s
+            // linear part M (encoder px -> source px) for each rotation
+            val m00 = when (rot) { 0 -> a; 180 -> -a; else -> 0.0 }
+            val m01 = when (rot) { 90 -> -s; 270 -> s; else -> 0.0 }
+            val m10 = when (rot) { 90 -> s; 270 -> -s; else -> 0.0 }
+            val m11 = when (rot) { 0 -> a; 180 -> -a; else -> 0.0 }
+            val t = doubleArrayOf(121.4, 37.2)
+            val aff = floatArrayOf(m00.toFloat(), m01.toFloat(), t[0].toFloat(), m10.toFloat(), m11.toFloat(), t[1].toFloat())
+
+            assertEquals("rotation classification (rot=$rot)", rot, GeometryMath.mappingRotationDeg(aff))
+            val k = GeometryMath.tryExactRectilinear(src, aff) ?: error("no rectilinear K for rot=$rot")
+
+            val R = GeometryMath.sourceFromEncodedRotation(rot)
+            for (p in pts) {
+                // Path A (canonical): ARCore cam point -> source K -> source px -> affine^-1 -> encoded px
+                val xS = src.fx * p[0] / p[2] + src.cx
+                val yS = src.fy * p[1] / p[2] + src.cy
+                // invert 2x2 affine: p_enc = M^-1 (p_src - t)
+                val det = m00 * m11 - m01 * m10
+                val dx = xS - t[0]; val dy = yS - t[1]
+                val uA = (m11 * dx - m01 * dy) / det
+                val vA = (m00 * dy - m10 * dx) / det
+
+                // Path B: rotate the point into the encoded camera frame
+                // (p_enc_cam = R^T p_arcore), then plain pinhole with encoded K.
+                val xe = R[0] * p[0] + R[3] * p[1] + R[6] * p[2]
+                val ye = R[1] * p[0] + R[4] * p[1] + R[7] * p[2]
+                val ze = R[2] * p[0] + R[5] * p[1] + R[8] * p[2]
+                val uB = k.fx * xe / ze + k.cx
+                val vB = k.fy * ye / ze + k.cy
+
+                val du = (uA - uB).let { if (it > 0) it else -it }
+                val dv = (vA - vB).let { if (it > 0) it else -it }
+                assertTrue(
+                    "round-trip mismatch rot=$rot pt=${p.contentToString()} du=$du dv=$dv",
+                    du < 1e-3 && dv < 1e-3  // sub-pixel; residual is float32 precision of the fitted affine
+                )
+            }
+        }
+    }
+
+    @Test
     fun `tryExactRectilinear refuses genuine shear`() {
         val src = CameraIntrinsics(320, 240, 100.0, 150.0, 160.0, 120.0)
         assertNull(GeometryMath.tryExactRectilinear(src, floatArrayOf(0.5f, 0.1f, 0f, 0f, 0.5f, 0f)))

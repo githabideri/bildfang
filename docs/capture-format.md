@@ -432,6 +432,41 @@ mapping rotates, translates, or anisotropically scales — and a wrong
 viewport/UV mapping is what invalidated the 2026-09-01 washroom video
 (see ROADMAP P1.1).
 
+#### The canonical projection chain (read before building rays)
+
+For a 90°/270° mapping the encoded image is **image-axis-rotated**
+relative to the ARCore source camera frame. A stored `K_encoded` is a
+standard pinhole K in the *encoded camera frame* — not in the ARCore
+camera frame. Consumers must use one of exactly these two chains (they
+are mathematically identical, proven by the projection round-trip unit
+test for all four rotations):
+
+```
+Chain A (canonical, always valid — prefer this one):
+  encoded pixel (u, v)
+  → affine_enc_to_src :  p_src = M·p_enc + t        (source-image pixels)
+  → K_src⁻¹           :  ray in the ARCore camera frame
+  → ARCore c2w pose   :  world coordinates
+
+Chain B ("K + pose in one frame" form, for pipelines that need it):
+  encoded pixel (u, v)
+  → K_encoded⁻¹       :  ray in the ENCODED camera frame
+  → R(k) axis rotation:  ray in the ARCore camera frame
+                          (k = rectilinear_model.rotation; 3×3 R whose
+                          2×2 part matches M, depth axis unchanged)
+  → (ARCore c2w rotation · R)  :  world coordinates
+```
+
+The encoded camera frame shares the ARCore camera's optical center; its
+c2w rotation is the ARCore c2w rotation composed with R(k).
+
+**Do not** combine `K_encoded` with the *unchanged* ARCore pose (i.e.
+treat the encoded image's axes as if they were the ARCore camera axes):
+that is wrong for the fleet devices' 90/270° mapping (it is only valid
+when k is 0/180 with a pure per-axis flip). `tools/inspect_capture.py`
+recomputes `K_encoded` from the persisted affine + source K, so any
+consumer can verify either chain against the session itself.
+
 **Validity of the 2026-09-01 washroom capture
 (`capture-20260901T200005-9dc67864`)**: VALID for ARCore trajectory
 analysis (poses are independent of the video bug); **INVALID for any

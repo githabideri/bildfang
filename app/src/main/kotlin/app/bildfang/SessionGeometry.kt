@@ -266,6 +266,22 @@ object GeometryMath {
      * Never invent numbers: null is the honest answer.
      */
     /**
+     * 3×3 row-major rotation from the *encoded* camera frame to the ARCore
+     * source camera frame, for a 90°-multiple mapping rotation. The
+     * encoded camera frame is the ARCore frame with its image axes
+     * permuted to match the encoded image orientation; the optical center
+     * and depth axis are unchanged. Use it as: `p_arcore = R · p_encoded`
+     * (i.e. an encoded-camera c2w rotation = ARCore c2w rotation · R).
+     */
+    fun sourceFromEncodedRotation(rotDeg: Int): DoubleArray = when (rotDeg) {
+        0 -> doubleArrayOf(1.0, 0.0, 0.0,  0.0, 1.0, 0.0,  0.0, 0.0, 1.0)
+        90 -> doubleArrayOf(0.0, -1.0, 0.0, 1.0, 0.0, 0.0,  0.0, 0.0, 1.0)
+        180 -> doubleArrayOf(-1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0)
+        270 -> doubleArrayOf(0.0, 1.0, 0.0,  -1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+        else -> error("mapping rotation must be a 90-degree multiple, got $rotDeg")
+    }
+
+    /**
      * Rotation class of an affine mapping: the k in `M ≈ R(k) · S` with R a
      * 90° multiple rotation and S a diagonal scale — 0 (identity or
      * axis-flips), 90 (CCW), 180, 270 — or −1 when M has genuine shear /
