@@ -42,9 +42,9 @@ filter, discard, or silently alter the preserved raw capture.
 | P3 | Clock-domain model | **DONE** | `capture-format.md` rewritten: named domains (arcore_frame / android_camera / android_monotonic / wall_clock / sensor / container_pts), guaranteed/measured/unknown, no epoch claims; `frame_timestamp_raw_ns` stored per pose |
 | P4 | De-contradict capture-format.md clocks | **DONE** | same rewrite; "one shared clock" invariant removed; IMU + invariants sections aligned with the domain model |
 | P5 | Raw poses + trajectory_discontinuity | **IN PROGRESS** | multi-signal discontinuity detection → `poses/discontinuities.json` (informational, not a verdict); `translation_raw` + explicit SE(3) segment transform deferred until after v1 live-verify (schema freeze, step 9) |
-| P6 | Intrinsics: source-tagged, validated scaling | not started | |
-| P7 | Full preservation package + manifest | not started | now on top of the MediaCodec recorder: `video/camera.mp4` + authoritative `frames.json`, counters in manifest, manifest written last |
-| P8 | Raw IMU logging | not started | |
+| P6 | Intrinsics: source-tagged, validated scaling | **locally verified (v0.4.0, 2026-10-04)** | `camera/intrinsics.json` with explicit `source` tags; distortion never fabricated; encoded K derived only when the frozen mapping is a 90°-multiple orthogonal transform (three states: EXACT/ABSENT/REFUSED); unit-tested | 
+| P7 | Full preservation package + manifest | **locally verified (v0.4.0, 2026-10-04)** | full payload set in the spec's order; `manifest.json` written **last**, atomically (tmp + rename): SHA-256 per payload, sizes, app version + git commit (BuildConfig), warnings list, `completeness: complete`; an interrupted capture has no manifest and stays distinguishable; unit-tested incl. known hash vectors. On-device gate: BF-T04 | 
+| P8 | Raw IMU logging | **locally verified (v0.4.0, 2026-10-04)** | raw accelerometer + gyroscope `SensorEvent` samples merged in `android_monotonic` order → `imu/imu.csv`; 100 ms carry-freshness window (stale = empty cell, gap is data); missing sensors drop their columns; achieved rate **measured** (not assumed) and persisted in `device.json`; unit-tested | 
 | P9 | Cheap capture-health signals | not started | |
 | P10 | Local visual continuity | not started | |
 | P11 | Coverage model | not started | |
@@ -680,6 +680,15 @@ it means reset / relocalization / bad pose / fast motion):
 
 ## P6 — Intrinsics: document what is actually provided
 
+**Status (2026-10-04): implemented in v0.4.0, locally verified (unit
+tests; on-device capture with this build still pending).** `IntrinsicsJson.kt`
+writes `camera/intrinsics.json` with explicit `source` tagging
+(`arcore` for what the platform exposed, `derived:arcore` for the
+encoded-image K), `distortion: null` with an explanatory note (ARCore
+exposes no distortion coefficients; a k1/k2/p1/p2/k3 model belongs to
+Camera2 `CALIBRATION_REVIEW` metadata and is never fabricated here), and
+the three-state `encoded_image` (EXACT / ABSENT / REFUSED) mirroring the
+rectilinear model in `session.json`.
 ARCore `CameraIntrinsics` provides focal length, principal point, image
 dimensions. Stop presenting `k1,k2,p1,p2,k3` as ARCore data (that model
 belongs to Camera2 `CALIBRATION_REVIEW` metadata). Record `source`
@@ -692,6 +701,21 @@ optical geometry.
 
 ## P7 — Complete preservation-grade capture/v1
 
+**Status (2026-10-04): implemented in v0.4.0, locally verified (unit
+tests; on-device capture still pending).** `ManifestJson.kt` writes the
+full payload set in the spec's order and `manifest.json` **last**,
+atomically (temp file + rename, so a truncated manifest can never
+exist). The manifest carries: schema + `completeness: complete` (its mere
+presence is the completeness fact — an interrupted capture has no
+manifest), app name/version + **git commit** (baked in at build time via
+`BuildConfig`, so a session identifies its exact build), device model,
+ARCore Play-services version, start/end (wall_clock) + duration
+(android_monotonic), per-payload `size_bytes` + `sha256` (streamed
+digest, never loads the video), and a `warnings` list (dropped frames,
+rotation events, discontinuities, missing IMU, missing/empty video).
+The session browser treats `manifest.json` (or, for pre-0.4.0 sessions,
+`session.json`) as the completeness marker. On-device acceptance is
+BF-T04 (interrupted capture).
 After timing + pose semantics are verified:
 
 ```text
@@ -725,6 +749,20 @@ from a finalized one.
 
 ## P8 — Raw IMU logging
 
+**Status (2026-10-04): implemented in v0.4.0, locally verified (unit
+tests; on-device capture still pending).** `ImuLogger.kt` registers
+`TYPE_ACCELEROMETER` + `TYPE_GYROSCOPE` at `SENSOR_DELAY_GAME` for the
+duration of a recording (registered at START, unregistered before the
+export snapshot) and preserves the raw `SensorEvent` samples with their
+native `android_monotonic` timestamps. `ImuCsv.kt` merges both streams
+into `imu/imu.csv` in timestamp order: one row per newest sample, the
+other stream carried while fresh (100 ms window — a stale value is an
+empty cell, because the gap is the data), missing sensors drop their
+columns entirely (the header is the column contract), decimals are
+locale-fixed (a German-locale device must not emit `9,82`). The actually
+achieved rate is **measured** from the captured samples and persisted in
+`metadata/device.json` (`imu_rate_hz`, null when <2 samples) — never
+assumed to be 50 Hz.
 Preserve raw accelerometer + gyroscope `SensorEvent` samples with their
 native timestamps. No resampling in the preservation layer. Measure the
 actual sample rate; document what was observed, not an assumption.
@@ -861,10 +899,11 @@ Strictly, unless an earlier step exposes a blocker:
 3. P2 custom-track playback round-trip
 4. P3/P4 establish and document clock domains
 5. P5 raw pose/discontinuity semantics
-6. P6 validate intrinsics assumptions
-7. P7 complete manifest/package
-8. P8 raw IMU
-9. freeze a trustworthy capture-format v1 baseline
+6. P6 validate intrinsics assumptions — **done in v0.4.0 (2026-10-04)**
+7. P7 complete manifest/package — **done in v0.4.0 (2026-10-04)**
+8. P8 raw IMU — **done in v0.4.0 (2026-10-04)**
+9. freeze a trustworthy capture-format v1 baseline (live-verify v0.4.0 on
+   a device first: BF-T04/T05, then re-run the BF-T03 dataset with it)
 10. P9 simple capture-health feedback
 11. P10 local visual continuity
 12. P11 coverage

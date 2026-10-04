@@ -77,8 +77,10 @@ import kotlin.math.roundToInt
 *    encoder's input surface in the same GL loop as the preview, with a
 *    session-relative presentation time (android_camera timestamp minus
 *    the first encoded frame's; persisted as video_timebase). STOP:
-*    encoder flush, atomic finalization, then poses.json + video/frames.json
-*    + session.json.
+*    encoder flush, atomic finalization, then the full payload set in
+*    the spec's order (imu -> poses -> frames -> intrinsics -> device ->
+*    session.json) and `manifest.json` LAST (P7: the completeness marker;
+*    an interrupted capture stays distinguishable from a finalized one).
 *
 *  - Geospatial mode is DISABLED explicitly: bildfang is a local-only
 *    logger, it neither needs nor stores location data.
@@ -137,6 +139,9 @@ class MainActivity : Activity() {
     private val camMetaRecords = ArrayList<CameraMetaRecord>()
     private var camMetaProbeDone = false
     private var stabilizationConfig = "unknown"
+
+    // ---- P8: raw IMU logging (SensorEvent, android_monotonic domain) ----
+    private var imu: ImuLogger? = null
 
     // ---- P1.1 steps 6-7: storage (SAF) + session browser ----
     private var storageRootUri: Uri? = null
@@ -379,6 +384,9 @@ class MainActivity : Activity() {
                 uvFrozen = false
                 uvFreezePending = false
                 try {
+                    // P8: the IMU listener dies with the recording; stop it
+                    // first so no samples land after the export snapshot.
+                    try { imu?.stop() } catch (_: Exception) {}
                     rec?.stop()
                     recording = false
                     postToUi { finalizeExport() }
@@ -876,6 +884,7 @@ class MainActivity : Activity() {
         // A recording in progress is finalized (best effort) so the
         // session is never left half-written; the manifest (P7) marks it.
         if (recording) {
+            try { imu?.stop() } catch (ignored: Exception) {}
             try { recorder?.stop() } catch (ignored: Exception) {}
             recorder = null
             recording = false
@@ -963,6 +972,17 @@ class MainActivity : Activity() {
         geomFrozen = false
         uvFrozen = false
         uvFreezePending = true // consumed on the first recording frame (GL thread)
+        // P8: raw IMU for the duration of the capture (SENSOR_DELAY_GAME;
+        // the actually achieved rate is measured from the data and
+        // persisted, not assumed). Missing sensors degrade to empty
+        // columns, never to a failure.
+        imu = runCatching {
+            ImuLogger(getSystemService(android.hardware.SensorManager::class.java)).also {
+                it.start()
+                android.util.Log.i("bildfang", "IMU start: accel=${it.accelerometerName} (${if (it.accelerometerPresent) "present" else "ABSENT"}), " +
+                    "gyro=${it.gyroscopeName} (${if (it.gyroscopePresent) "present" else "ABSENT"})")
+            }
+        }.getOrNull()
 
         // P2a: MediaCodec H.264 (surface input) + MediaMuxer — our recorder,
         // our timestamps, our muxing. Bitrate scales with the canvas area
@@ -1012,7 +1032,28 @@ class MainActivity : Activity() {
             return
         }
 
+        // P8: snapshot the IMU streams (the listener was unregistered on
+        // the GL thread; nothing lands after this).
+        val (imuAccel, imuGyro) =
+            imu?.snapshot() ?: (emptyList<ImuLogger.Sample>() to emptyList<ImuLogger.Sample>())
+        val warnings = ArrayList<String>()
+        recCounters()?.let { c ->
+            if (c.framesDropped > 0)
+                warnings.add("${c.framesDropped} frame(s) dropped (submit failures; see video/frames.json counters)")
+        }
+        if (rotationEventsDuringRec > 0)
+            warnings.add("$rotationEventsDuringRec display-rotation event(s) during recording (geometry frozen; see session.json)")
+        if (discSnapshot.isNotEmpty())
+            warnings.add("${discSnapshot.size} trajectory discontinuit(y/ies) detected (informational; see poses/discontinuities.json)")
+        if (imuAccel.isEmpty() && imuGyro.isEmpty())
+            warnings.add("no IMU samples captured (sensor missing, suspended, or failed; imu/imu.csv is header-only)")
+
         try {
+            // File order per docs/capture-format.md: imu -> poses ->
+            // frames/video-index -> intrinsics -> device -> session ->
+            // manifest (manifest LAST = completeness marker, P7).
+            File(dir, "imu/imu.csv").apply { parentFile?.mkdirs() }
+                .writeText(ImuCsv.build(imuAccel, imuGyro))
             val poseFile = File(dir, "poses/poses.json").apply { parentFile?.mkdirs() }
             poseFile.writeText(PoseJson.build(snapshot))
             File(dir, "poses/discontinuities.json")
@@ -1025,18 +1066,171 @@ class MainActivity : Activity() {
             val availability = CameraMetaJson.availabilityOf(camMetaRecords)
             File(dir, "camera/frames.json").apply { parentFile?.mkdirs() }
                 .writeText(CameraMetaJson.build(camMetaRecords, availability, stabilizationConfig))
+            // P6: intrinsics with explicit source tagging (what the
+            // platform actually provided; no fabricated distortion).
+            File(dir, "camera/intrinsics.json").apply { parentFile?.mkdirs() }
+                .writeText(buildIntrinsicsJson())
+            // P7: device identity at model level + measured IMU rates.
+            File(dir, "metadata/device.json").apply { parentFile?.mkdirs() }
+                .writeText(buildDeviceJson(imu, imuAccel, imuGyro))
             File(dir, "session.json").writeText(buildSessionJson())
+            val videoFileOk = videoFile?.let { it.exists() && it.length() > 0 } == true
+            if (!videoFileOk) warnings.add("video missing or empty (no muxed frames; poses-only session)")
+            // P7: manifest written last, atomically (tmp + rename). A
+            // session without a complete manifest.json is
+            // invalid/incomplete — an interrupted capture stays
+            // distinguishable from a finalized one.
+            val manifestOk = writeManifest(dir, warnings)
             // P1.1 steps 6/7: if the user picked a SAF folder, the finished
             // session is mirrored there and the app-private copy is
             // removed.
             if (storageRootUri != null) {
                 copySessionToSaf(dir)
             } else {
-                statusView.text = "Saved · ${snapshot.size} poses · video + pose track"
+                statusView.text = "Saved · ${snapshot.size} poses · " +
+                    if (manifestOk) "manifest OK (complete session)" else "MANIFEST FAILED (session incomplete)"
             }
         } catch (e: Exception) {
             statusView.text = "Export failed: ${e.message}"
         }
+    }
+
+    /** Convenience: the recorder's counters, if any (null = no recorder). */
+    private fun recCounters(): RecorderCounters? = recorder?.counters
+
+    /**
+     * P6: `camera/intrinsics.json` from the frozen geometry. Source is
+     * explicitly tagged ("arcore"); the encoded-image model is the
+     * derived rectilinear K (EXACT only) — the affine chain in
+     * session.json stays canonical; nothing is scaled/guessed.
+     */
+    private fun buildIntrinsicsJson(): String {
+        val g = sessionGeom
+        val enc: IntrinsicsJson.EncodedModel? = g?.let {
+            val k = encRectilinear // width/height already set to the encoder canvas
+            val status = when {
+                k != null -> "EXACT"
+                encModelRefused -> "REFUSED"
+                else -> "ABSENT"
+            }
+            IntrinsicsJson.EncodedModel(
+                width = g.encoderWidth,
+                height = g.encoderHeight,
+                status = status,
+                rotationDeg = encAffine?.let { GeometryMath.mappingRotationDeg(it) } ?: -1,
+                k = k,
+            )
+        }
+        return IntrinsicsJson.build(
+            arcoreImage = g?.sourceTextureIntrinsics,
+            arcoreCameraImage = g?.sourceImageIntrinsics,
+            encoded = enc,
+            cameraId = "back",
+        )
+    }
+
+    /** P7: `metadata/device.json` (model-level identity; measured rates). */
+    private fun buildDeviceJson(
+        imu: ImuLogger?,
+        accel: List<ImuLogger.Sample>,
+        gyro: List<ImuLogger.Sample>,
+    ): String {
+        val dm = resources.displayMetrics
+        val d = DeviceJson.DeviceInfo(
+            manufacturer = android.os.Build.MANUFACTURER,
+            model = android.os.Build.MODEL,
+            androidVersion = android.os.Build.VERSION.RELEASE,
+            sdkInt = android.os.Build.VERSION.SDK_INT,
+            os = android.os.Build.FINGERPRINT,
+            screenW = dm.widthPixels,
+            screenH = dm.heightPixels,
+            densityDpi = dm.densityDpi,
+            accelPresent = imu?.accelerometerPresent == true,
+            gyroPresent = imu?.gyroscopePresent == true,
+            accelName = imu?.accelerometerName ?: "",
+            gyroName = imu?.gyroscopeName ?: "",
+            imuAccelRateHz = imu?.rateHz(accel)?.takeIf { it > 0.0 },
+            imuGyroRateHz = imu?.rateHz(gyro)?.takeIf { it > 0.0 },
+            wallClockAtStartIso = if (anchorUnixMs > 0) wallIso(anchorUnixMs) else "",
+            bootTimeAtStartMs = anchorMonoNs / 1_000_000,
+        )
+        return DeviceJson.build(d)
+    }
+
+    private fun wallIso(ms: Long): String =
+        SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
+            .apply { timeZone = TimeZone.getTimeZone("UTC") }.format(Date(ms))
+
+    /**
+     * P7: hash every payload file and write `manifest.json` LAST, via a
+     * temp file + rename (atomic: no truncated manifest can ever exist).
+     * Returns whether the manifest was fully written.
+     */
+    private fun writeManifest(dir: File, warnings: ArrayList<String>): Boolean {
+        val arcore = try {
+            packageManager.getPackageInfo("com.google.ar.core", 0).versionName ?: "unknown"
+        } catch (e: Exception) { "unknown" }
+        val startedIso = if (anchorUnixMs > 0) wallIso(anchorUnixMs) else ""
+        val endedIso = wallIso(System.currentTimeMillis())
+        val durationNs = if (anchorMonoNs > 0)
+            (SystemClock.elapsedRealtimeNanos() - anchorMonoNs).coerceAtLeast(0L)
+        else 0L
+
+        val payload: List<Pair<String, String>> = listOf(
+            "video/camera.mp4" to ManifestJson.T_VIDEO,
+            "video/frames.json" to ManifestJson.T_FRAME_INDEX,
+            "poses/poses.json" to ManifestJson.T_POSE,
+            "poses/discontinuities.json" to ManifestJson.T_DISCONTINUITY,
+            "imu/imu.csv" to ManifestJson.T_IMU,
+            "camera/intrinsics.json" to ManifestJson.T_INTRINSICS,
+            "camera/frames.json" to ManifestJson.T_CAMERA_METADATA,
+            "metadata/device.json" to ManifestJson.T_DEVICE,
+            "session.json" to ManifestJson.T_SESSION,
+        )
+        val files = ArrayList<ManifestJson.ManifestFile>()
+        for ((rel, type) in payload) {
+            val f = File(dir, rel)
+            if (f.exists() && f.length() > 0) {
+                files.add(ManifestJson.ManifestFile(rel, type, f.length(), ManifestJson.sha256Hex(f)))
+            } else if (rel != "video/camera.mp4") {
+                // camera.mp4 absence is already warned about (poses-only)
+                warnings.add("$rel missing or empty")
+            }
+        }
+        val data = ManifestJson.ManifestData(
+            captureId = dir.name,
+            appName = "bildfang",
+            appVersion = APP_VERSION,
+            appCommit = BuildConfig.GIT_COMMIT,
+            deviceManufacturer = android.os.Build.MANUFACTURER,
+            deviceModel = android.os.Build.MODEL,
+            androidVersion = android.os.Build.VERSION.RELEASE,
+            sdkInt = android.os.Build.VERSION.SDK_INT,
+            arcoreVersion = arcore,
+            startedAtIso = startedIso,
+            endedAtIso = endedIso,
+            durationNs = durationNs,
+            files = files,
+            warnings = warnings,
+        )
+        val tmp = File(dir, "manifest.json.tmp")
+        val final = File(dir, "manifest.json")
+        if (final.exists()) final.delete()
+        var ok = false
+        try {
+            tmp.writeText(ManifestJson.build(data))
+            if (!tmp.renameTo(final)) tmp.copyTo(final, overwrite = true)
+            ok = final.exists()
+        } catch (e: Exception) {
+            android.util.Log.w("bildfang", "manifest write failed", e)
+        }
+        if (!ok) {
+            if (tmp.exists()) tmp.delete()
+            warnings.add("manifest write failed — this session is INCOMPLETE")
+        }
+        android.util.Log.i("bildfang", "manifest ${if (ok) "finalized" else "FAILED"}: " +
+            "${files.size} file(s) hashed, ${warnings.size} warning(s)")
+        return ok
     }
 
     private fun buildSessionJson(): String {
@@ -1077,7 +1271,8 @@ class MainActivity : Activity() {
             {
               "schema": "bildfang-capture/v1",
               "app": "bildfang",
-              "app_version": "0.3.0",
+              "app_version": "${APP_VERSION}",
+              "app_commit": "${BuildConfig.GIT_COMMIT}",
               "created_utc": "${SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply { timeZone = TimeZone.getTimeZone("UTC") }.format(Date())}",
               "arcore_sdk": "$arcore",
               "device": "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}",
@@ -1141,6 +1336,10 @@ class MainActivity : Activity() {
               "frames_file": "video/frames.json",
               "poses_file": "poses/poses.json",
               "discontinuities_file": "poses/discontinuities.json",
+              "imu_file": "imu/imu.csv",
+              "intrinsics_file": "camera/intrinsics.json",
+              "device_file": "metadata/device.json",
+              "manifest_file": "manifest.json (written last; its presence = complete session)",
               "clock": {
                 "anchor_frame_ts": $frameTsAnchor,
                 "anchor_unix_ms": $anchorUnixMs,
@@ -1566,11 +1765,11 @@ class MainActivity : Activity() {
         val apSes = File(apBase, "sessions")
         if (apSes.isDirectory) {
             apSes.listFiles()?.filter { it.isDirectory }?.sortedBy { it.name }?.forEach {
-                items.add(Item("app: ${it.name}", dirSize(it), File(it, "session.json").exists(), it))
+                items.add(Item("app: ${it.name}", dirSize(it), File(it, "manifest.json").exists() || File(it, "session.json").exists(), it))
             }
         }
         safSessions().sortedBy { it.name }.forEach {
-            items.add(Item("saf: ${it.name}", docSize(it), it.findFile("session.json") != null, it))
+            items.add(Item("saf: ${it.name}", docSize(it), it.findFile("manifest.json") != null || it.findFile("session.json") != null, it))
         }
         if (items.isEmpty()) {
             statusView.text = "No sessions yet"
@@ -1612,5 +1811,11 @@ class MainActivity : Activity() {
     private companion object {
         // GL_TEXTURE_EXTERNAL_OES (not in GLES20)
         const val GL_TEXTURE_EXTERNAL_OES = 0x8D65
+
+        // Bumped by hand with each on-device milestone (0.3.0 =
+        // geometry-frozen recorder 2026-09-02; 0.4.0 = capture-format v1
+        // freeze: manifest-last finalize + hashes, source-tagged
+        // intrinsics, raw IMU).
+        const val APP_VERSION = "0.4.0"
     }
 }

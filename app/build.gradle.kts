@@ -5,6 +5,17 @@ plugins {
 
 import java.util.Properties
 
+/** Short git commit at build time (BuildConfig.GIT_COMMIT; "unknown" when
+ *  the checkout has no git metadata). The commit lands in manifest.json
+ *  so a session identifies the exact app build that produced it. */
+private fun shortGitSha(project: Project): String = try {
+    val out = ProcessBuilder("git", "rev-parse", "--short", "HEAD")
+        .directory(project.projectDir)
+        .redirectErrorStream(true)
+        .start().inputStream.bufferedReader().readText().trim()
+    if (out.isNotEmpty()) out else "unknown"
+} catch (e: Exception) { "unknown" }
+
 android {
     namespace = "app.bildfang"
     compileSdk = 34
@@ -13,8 +24,9 @@ android {
         applicationId = "app.bildfang"
         minSdk = 24
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.4.0"
+        buildConfigField("String", "GIT_COMMIT", "\"${shortGitSha(project)}\"")
     }
 
     buildTypes {
@@ -44,6 +56,9 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+    }
+    buildFeatures {
+        buildConfig = true
     }
     kotlinOptions {
         jvmTarget = "17"

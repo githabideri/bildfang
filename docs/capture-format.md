@@ -8,16 +8,18 @@ files relate to each other.
 capture-YYYYMMDDTHHMMSS-<6hex>/
 ├── video/
 │   ├── camera.mp4
-│   └── frames.json            # Phase 2: video pts ↔ ARCore frame index
+│   └── frames.json            # video pts ↔ ARCore frame index (authoritative)
 ├── poses/
-│   └── poses.json             # one entry per ARCore-tracked frame
+│   ├── poses.json             # one entry per ARCore-tracked frame
+│   └── discontinuities.json   # multi-signal trajectory breaks (informational)
 ├── imu/
-│   └── imu.csv
+│   └── imu.csv                # raw accelerometer + gyroscope (0.4.0+)
 ├── camera/
-│   └── intrinsics.json
+│   ├── intrinsics.json        # source-tagged (0.4.0+)
+│   └── frames.json            # per-frame camera metadata (exposure, ISO, …)
 ├── metadata/
-│   └── device.json
-└── manifest.json
+│   └── device.json            # model-level identity + measured IMU rates (0.4.0+)
+└── manifest.json              # written LAST — its presence = complete session
 ```
 
 **Naming:** the folder name equals `capture_id`. The `YYYYMMDDTHHMMSS` part
@@ -28,11 +30,14 @@ folder can be dropped into a Bildwerk ingestion flow without renaming.
 **Encoding:** all text files UTF-8. JSON: 2-space indent, one entry per line
 where reasonable. CSV: LF line endings, CRLF-free.
 
-> **Reading this document:** sections marked **[planned]** describe the
-> target `bildfang-capture/v1` schema. What build 0.3.x actually writes is
-> documented in **`session.json` — what build 0.3.0 actually writes**
-> further down; where the two differ, that section wins for current
-> captures. The ARCore-native-recording design described in places is a
+> **Reading this document:** this is the `bildfang-capture/v1` schema as
+> implemented by **build 0.4.0** (the first build writing the full v1
+> payload set: `imu.csv`, `intrinsics.json`, `device.json` and the
+> manifest-last finalization). Older builds wrote only `session.json` +
+> the video/pose files; see `session.json` below for what 0.3.0 wrote.
+> Where build behavior and this document could differ, **the session
+> folder is the truth** (it carries the app version + git commit in its
+> manifest). The ARCore-native-recording design described in places is a
 > **dead end on the current fleet** (see ROADMAP P2b) and is kept only as
 > history.
 
@@ -104,58 +109,72 @@ the domains are equal.
 > authoritative `video/frames.json`, `poses/poses.json`,
 > `camera/frames.json` camera metadata).
 
-## `manifest.json` **[planned — not written by current builds]**
+## `manifest.json` — the completeness marker (written by build 0.4.0+)
 
-Written last, atomically (write to `manifest.json.tmp` then rename). A
-session without a complete `manifest.json` is invalid/incomplete. The
-current build's completeness marker is instead a fully-populated
-`session.json` (written after the video finalize); `sha256` file hashes
-remain a target for a future build.
+**Written last, atomically** (write to `manifest.json.tmp`, then rename).
+A session without a complete `manifest.json` is **invalid/incomplete** —
+that is the whole point of the ordering: an interrupted capture
+(force-stop, crash, power loss) leaves every other file but never a
+manifest, so completeness is a *file-existence* fact, not a claim.
+Builds before 0.4.0 do not write it; there the completeness marker is a
+fully-populated `session.json` (and the session browser treats either as
+"complete").
 
 ```json
 {
   "schema": "bildfang-capture/v1",
+  "completeness": "complete",
   "capture_id": "capture-20260831T120000-ab12cd",
   "app": {
-    "name": "Bildfang",
-    "version": "0.1.0",
-    "commit": "abc1234"
+    "name": "bildfang",
+    "version": "0.4.0",
+    "commit": "c06bc9a"
   },
   "device": {
     "manufacturer": "Google",
     "model": "Pixel 9 Pro",
     "android_version": "15",
-    "sdk_int": 35
+    "sdk_int": 34
   },
-  "arcore": {
-    "play_services_version": "x.y.z",
-    "tracking_features": ["motion", "imu_fusion"],
-    "environment": "OUTDOOR"
-  },
-  "started_at": "2026-08-31T12:00:00.000Z",
-  "ended_at": "2026-08-31T12:02:41.520Z",
-  "duration_ns": 161520000000,
-  "monotonic": {
-    "clock": "SystemClock.elapsedRealtimeNanos",
-    "boot_time_at_start_ms": 4321000,
-    "session_start_ns": 4321000000000
-  },
+  "arcore": { "play_services_version": "1.54.0" },
+  "started_at": "2026-08-31T12:00:00Z",
+  "ended_at": "2026-08-31T12:00:38Z",
+  "duration_ns": 38000000000,
   "files": [
-    { "path": "video/camera.mp4",  "type": "video",    "size_bytes": 629145600, "sha256": "…" },
-    { "path": "video/frames.json", "type": "frame_index", "size_bytes": 182334, "sha256": "…" },
-    { "path": "poses/poses.json",  "type": "pose",     "size_bytes": 912345,  "sha256": "…" },
-    { "path": "imu/imu.csv",       "type": "imu",      "size_bytes": 402334,  "sha256": "…" },
-    { "path": "camera/intrinsics.json", "type": "intrinsics", "size_bytes": 321, "sha256": "…" },
-    { "path": "metadata/device.json", "type": "device", "size_bytes": 210, "sha256": "…" }
+    { "path": "video/camera.mp4",       "type": "video",          "size_bytes": 629145600, "sha256": "…" },
+    { "path": "video/frames.json",      "type": "frame_index",    "size_bytes": 182334,    "sha256": "…" },
+    { "path": "poses/poses.json",       "type": "pose",           "size_bytes": 912345,    "sha256": "…" },
+    { "path": "poses/discontinuities.json", "type": "discontinuities", "size_bytes": 214, "sha256": "…" },
+    { "path": "imu/imu.csv",            "type": "imu",            "size_bytes": 402334,    "sha256": "…" },
+    { "path": "camera/intrinsics.json", "type": "intrinsics",     "size_bytes": 321,       "sha256": "…" },
+    { "path": "camera/frames.json",     "type": "camera_metadata","size_bytes": 88213,     "sha256": "…" },
+    { "path": "metadata/device.json",   "type": "device",         "size_bytes": 512,       "sha256": "…" },
+    { "path": "session.json",           "type": "session",        "size_bytes": 4210,      "sha256": "…" }
   ],
-  "created_at": "2026-08-31T12:02:41.830Z"
+  "warnings": ["2 trajectory discontinuit(y/ies) detected (informational; see poses/discontinuities.json)"]
 }
 ```
 
-`file.type` values: `video`, `frame_index`, `pose`, `imu`, `intrinsics`,
-`device`. `sha256` makes the session auditable end-to-end (hashes are
-computed by the app on export; downstream re-verification is a `sha256sum`
-away).
+Notes:
+
+- `completeness` is always the literal `"complete"` in 0.4.0: the only way
+  this file exists is that finalization ran to the end. Incomplete sessions
+  have *no* manifest (or only a transient `manifest.json.tmp`, deleted on
+  failure).
+- `app.commit` is the short git commit baked into the build at compile
+  time (`BuildConfig`), so a session identifies the exact build that
+  produced it.
+- `started_at`/`ended_at` are `wall_clock` domain (ISO-8601 UTC, second
+  precision); `duration_ns` is `android_monotonic`-derived.
+- `file.type` values: `video`, `frame_index`, `pose`, `discontinuities`,
+  `imu`, `intrinsics`, `camera_metadata`, `device`, `session`. Consumers
+  must ignore unknown types, not fail on them.
+- `warnings` is the app's own summary of what went wrong during the
+  capture (dropped frames, rotation events, discontinuities, missing IMU
+  samples, a missing/empty video). It is *informational* — it never
+  downgrades `completeness`, which is a file-existence fact.
+- `sha256` makes the session auditable end-to-end (hashes are computed by
+  the app on export; downstream re-verification is a `sha256sum` away).
 
 ## `poses/poses.json` — the most important output
 
@@ -197,17 +216,38 @@ chosen for tooling ergonomics at this size).
   `"segment": 1, 2, …`, default `0`). Consumers must only interpolate
   within a segment.
 
-## `camera/intrinsics.json` **[planned]**
+## `camera/intrinsics.json` (written by build 0.4.0+)
+
+`source` is explicit in every block: the numbers are what the platform
+**actually exposed** — nothing is scaled, fitted, or invented.
 
 ```
 {
   "schema": "bildfang-capture/v1-intrinsics",
   "model": "pinhole",
+  "source": "arcore",
+  "distortion": null,
+  "distortion_note": "ARCore CameraIntrinsics exposes no distortion coefficients; none are invented (a k1/k2/p1/p2/k3 model belongs to Camera2 CALIBRATION_REVIEW metadata)",
   "arcore_image": {
-    "width": 640, "height": 480,
-    "fx": 321.4, "fy": 321.7,
-    "cx": 320.0, "cy": 240.0
+    "width": 960, "height": 2142,
+    "fx": 623.1, "fy": 623.4, "cx": 479.5, "cy": 1071.2,
+    "source": "arcore",
+    "note": "ARCore Camera.getTextureIntrinsics() at START: the image the encoder actually samples"
   },
+  "arcore_camera_image": {
+    "width": 960, "height": 2142, "fx": 623.1, "fy": 623.4, "cx": 479.5, "cy": 1071.2,
+    "source": "arcore",
+    "note": "ARCore Camera.getImageIntrinsics(): the raw sensor image (equal to arcore_image on current fleet devices)"
+  },
+  "encoded_image": {
+    "width": 1080, "height": 2400,
+    "model": "pinhole",
+    "status": "EXACT (derived: arcore texture intrinsics + frozen affine mapping, 270-degree rotation)",
+    "source": "derived:arcore",
+    "rotation": 270,
+    "fx": 400.0, "fy": 400.0, "cx": 1200.0, "cy": 540.0
+  },
+  "canonical": "session.json → video.encoded_image.mapping (affine_enc_to_src) + arcore_image K is the exact model; see docs/capture-format.md",
   "camera_id": "back"
 }
 ```
@@ -217,39 +257,61 @@ chosen for tooling ergonomics at this size).
   coefficients** (there is no 5-coefficient k1/k2/p1/p2/k3 getter on the
   ARCore intrinsics API; radial/tangential distortion data lives in
   Camera2 metadata and is not available through the ARCore camera object
-  on the tested fleet devices). If a future build captures Camera2-
-  metadata distortion, it goes into `camera/frames.json` alongside the
-  other per-frame metadata, never into a fabricated field.
-- The earlier draft of this section showed a `video` block with
-  "ARCore intrinsics **scaled** from the ARCore image size to the video
+  on the tested fleet devices). `distortion` is therefore always `null`
+  with a note. If a future build captures Camera2-metadata distortion, it
+  goes into `camera/frames.json` alongside the other per-frame metadata,
+  never into a fabricated field.
+- `encoded_image` has three states, mirroring
+  `session.json → video.encoded_image.rectilinear_model`:
+  - **EXACT** — the frozen affine mapping is a 90°-multiple rotation +
+    uniform scale (no shear), so a rectilinear K in encoded pixels exists
+    and is derived (not scaled) from the texture intrinsics.
+  - **REFUSED** — the mapping has genuine shear / non-orthogonal
+    structure; no single rectilinear K is valid. The file then carries
+    only the status and a pointer to the affine chain.
+  - **ABSENT** — no source intrinsics were available at START.
+  The affine chain in `session.json → video.encoded_image.mapping` stays
+  the **canonical** description in all three cases.
+- The earlier draft of this section showed a `video` block with "ARCore
+  intrinsics **scaled** from the ARCore image size to the video
   resolution". **That claim is wrong and has been removed**: scaling is
   invalid whenever the encoded mapping rotates or translates the source
-  image (which it does on both fleet devices). The correct encoded-image
-  geometry is the affine chain in `session.json` →
-  `video.encoded_image.mapping`, with a derived rectilinear K only when
-  mathematically valid (see below).
-- If the session used multiple cameras (zoom switch), `camera_id` and the
-  intrinsics block repeat per camera; v0.1 captures with a single fixed
-  camera per session.
+  image (which it does on both fleet devices).
+- Single fixed back camera per session (`camera_id` fixed to `"back"`).
 
-## `imu/imu.csv` **[planned — P8, not captured by current builds]**
+## `imu/imu.csv` (written by build 0.4.0+)
+
+One row per merged sensor event, in `android_monotonic` order. Full
+header when both sensors are present (the header is the column contract):
 
 ```
-timestamp_ns,ax,ay,az,gx,gy,gz
-4321001234567,0.02,9.81,-0.11,0.001,0.002,-0.001
+ts_ns,type,accel_x,accel_y,accel_z,gyro_x,gyro_y,gyro_z
+1234,accel,0.01,9.82,-0.03,,,
+1268,gyro,0.01,9.82,-0.03,0.001,-0.002,0.001
 ```
 
 - Rows come from `SensorManager` (`TYPE_ACCELEROMETER`,
-  `TYPE_GYROSCOPE`), sampled at `SENSOR_DELAY_GAME` (≈50 Hz; raised to
-  `SENSOR_DELAY_FASTEST` in a later version if the device allows).
-- `timestamp_ns` = `SensorEvent.timestamp` — domain `android_monotonic`
+  `TYPE_GYROSCOPE`) requested at `SENSOR_DELAY_GAME` (≈50 Hz nominal).
+  The **actually achieved rate is measured from the captured samples**
+  and reported in `metadata/device.json → sensors.imu_rate_hz` (null when
+  fewer than two samples) — never assumed to be 50.
+- `ts_ns` = `SensorEvent.timestamp` — domain `android_monotonic`
   (on Android, `SensorEvent.timestamp` is `elapsedRealtimeNanos`). This is
   a *different* domain than the ARCore frame clock; the two are
   reconciled offline through the session anchor, never by assuming
   equality.
-- Acceleration in m/s² (gravity included), angular velocity in rad/s.
-- If one sensor is missing on a device, the affected columns are empty
-  (`4321…,0.02,9.81,-0.11,,,,`).
+- `type` names the stream that produced the newest sample at that
+  timestamp. The other stream's values are carried into the row **only
+  while fresh** (a sample from within the previous 100 ms); a stale
+  value is left as an empty cell — the gap is data, not noise.
+- A **missing sensor drops its columns entirely** (5-column file: header
+  `ts_ns,type,accel_x,accel_y,accel_z` or the gyro equivalent); a device
+  with neither sensor produces a header-only file. A suspended device
+  produces gaps in the rows, not in the clock (`android_monotonic`
+  keeps counting through sleep).
+- Units: acceleration m/s² (gravity included), angular velocity rad/s.
+  **Raw** — no gravity removal, no calibration, no resampling, no
+  filtering: downstream pipelines re-fuse however they like.
 - ARCore's pose already fuses IMU; this file is the **unfused raw trace**
   — it exists so future pipelines can re-fuse independently (and so a
   pipeline can cross-check ARCore's trajectory against raw sensors).
@@ -285,27 +347,29 @@ timestamp_ns,ax,ay,az,gx,gy,gz
   is measured against them (bounded, index-aligned residual — see
   `tools/inspect_capture.py`), never assumed equal.
 
-## `metadata/device.json`
+## `metadata/device.json` (written by build 0.4.0+)
 
-```json
+```
 {
   "schema": "bildfang-capture/v1-device",
   "manufacturer": "Google",
   "model": "Pixel 9 Pro",
   "android_version": "15",
-  "sdk_int": 35,
-  "os": "GrapheneOS 20260701" ,
-  "screen": { "width_px": 1280, "height_px": 2856, "density_dpi": 423 },
+  "sdk_int": 34,
+  "os": "Google/zumapro/caiman:15/…;1234567834:user/release-keys",
+  "screen": { "width_px": 1080, "height_px": 2400, "density_dpi": 423 },
   "sensors": {
     "accelerometer": "lsm6dso",
     "gyroscope": "lsm6dso",
-    "imu_rate_hz": 50
+    "imu_rate_hz": {
+      "accelerometer": 51.2,
+      "gyroscope": 51.1,
+      "note": "measured from the captured sample streams (SENSOR_DELAY_GAME requested); null when fewer than two samples"
+    }
   },
   "camera": {
     "back": {
-      "physical_id": "…",
-      "sensors": ["color", "imaging"],
-      "available_resolutions": [[3840, 2160], [1920, 1080]]
+      "note": "ARCore-managed camera; physical id not queried by v0.4 (model-level identity only)"
     }
   },
   "wall_clock_at_start": "2026-08-31T12:00:00Z",
@@ -313,8 +377,15 @@ timestamp_ns,ax,ay,az,gx,gy,gz
 }
 ```
 
-No `android_id`, no serial, no account identifiers — device identity is
-kept at model level (the capture stays portable and non-identifying).
+- A sensor that is **absent** on the device is reported as the string
+  `"ABSENT"` (and its columns drop out of `imu/imu.csv` — see above).
+- `sensors.imu_rate_hz` is **measured from the captured data of this
+  session**, not a datasheet value; `null` when fewer than two samples
+  were captured (rate undecidable, not assumed).
+- `os` is the build fingerprint (e.g. GrapheneOS builds on the fleet).
+- No `android_id`, no serial, no account identifiers — device identity is
+  kept at model level (the capture stays portable and non-identifying).
+  The camera physical id is deliberately not queried either.
 
 ## Interruptions & invariants
 
@@ -338,7 +409,7 @@ kept at model level (the capture stays portable and non-identifying).
      values; derived values are computed only from documented anchors;
   5. the manifest lists every file with size + sha256.
 
-## `session.json` — what build 0.3.x actually writes (v1, 2026-09-02)
+## `session.json` (v1, written by build 0.3.0+; extended in 0.4.0)
 
 Build 0.3.0 (the first build of the geometry-frozen recorder) writes the
 following `session.json` fields in addition to the sections above. All
@@ -382,6 +453,17 @@ camera_metadata.availability     per-key three-state table:
                                   AVAILABLE_AND_CAPTURED |
                                   SUPPORTED_BUT_UNAVAILABLE_ON_DEVICE |
                                   NOT_EXPOSED_BY_CURRENT_API
+app.version                      "0.4.0" — bumped by hand with each
+                                  on-device milestone (0.3.0 = geometry-
+                                  frozen recorder; 0.4.0 = full v1 payload
+                                  set: manifest-last finalization,
+                                  source-tagged intrinsics, raw IMU)
+app.commit                       short git commit baked in at build time
+                                  (BuildConfig) — the exact build
+files                            0.4.0 additionally points at the new
+                                  payloads: imu_file, intrinsics_file,
+                                  device_file, manifest_file ("written
+                                  last; its presence = complete session")
 storage.root / storage.sessions_path  where sessions are written (app-external
                                   default or a user-picked SAF tree)
 ```
