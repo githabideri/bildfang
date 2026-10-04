@@ -42,9 +42,9 @@ filter, discard, or silently alter the preserved raw capture.
 | P3 | Clock-domain model | **DONE** | `capture-format.md` rewritten: named domains (arcore_frame / android_camera / android_monotonic / wall_clock / sensor / container_pts), guaranteed/measured/unknown, no epoch claims; `frame_timestamp_raw_ns` stored per pose |
 | P4 | De-contradict capture-format.md clocks | **DONE** | same rewrite; "one shared clock" invariant removed; IMU + invariants sections aligned with the domain model |
 | P5 | Raw poses + trajectory_discontinuity | **IN PROGRESS** | multi-signal discontinuity detection → `poses/discontinuities.json` (informational, not a verdict); `translation_raw` + explicit SE(3) segment transform deferred until after v1 live-verify (schema freeze, step 9) |
-| P6 | Intrinsics: source-tagged, validated scaling | **locally verified (v0.4.0, 2026-10-04)** | `camera/intrinsics.json` with explicit `source` tags; distortion never fabricated; encoded K derived only when the frozen mapping is a 90°-multiple orthogonal transform (three states: EXACT/ABSENT/REFUSED); unit-tested | 
-| P7 | Full preservation package + manifest | **locally verified (v0.4.0, 2026-10-04)** | full payload set in the spec's order; `manifest.json` written **last**, atomically (tmp + rename): SHA-256 per payload, sizes, app version + git commit (BuildConfig), warnings list, `completeness: complete`; an interrupted capture has no manifest and stays distinguishable; unit-tested incl. known hash vectors. On-device gate: BF-T04 | 
-| P8 | Raw IMU logging | **locally verified (v0.4.0, 2026-10-04)** | raw accelerometer + gyroscope `SensorEvent` samples merged in `android_monotonic` order → `imu/imu.csv`; 100 ms carry-freshness window (stale = empty cell, gap is data); missing sensors drop their columns; achieved rate **measured** (not assumed) and persisted in `device.json`; unit-tested | 
+| P6 | Intrinsics: source-tagged, validated scaling | **live verified (v0.4.0, on-device 2026-10-04)** | `camera/intrinsics.json` with explicit `source` tags; distortion never fabricated; encoded K derived only when the frozen mapping is a 90°-multiple orthogonal transform (three states: EXACT/ABSENT/REFUSED); unit-tested; on-device captures validated (orthogonal mapping → rectilinear K consistent, portrait + landscape) | 
+| P7 | Full preservation package + manifest | **live verified (v0.4.0, on-device 2026-10-04; BF-T04 passed)** | full payload set in the spec's order; `manifest.json` written **last**, atomically (tmp + rename): SHA-256 per payload, sizes, app version + git commit (BuildConfig), warnings list, `completeness: complete`; an interrupted capture has no manifest and stays distinguishable — force-stop at 12 s left only `video/camera.mp4.tmp` (the recorder renames to final only on clean finalize, so an interrupted session never presents a final-named MP4); unit-tested incl. known hash vectors | 
+| P8 | Raw IMU logging | **live verified (v0.4.0, on-device 2026-10-04)** | raw accelerometer + gyroscope `SensorEvent` samples merged in `android_monotonic` order → `imu/imu.csv`; 100 ms carry-freshness window (stale = empty cell, gap is data); missing sensors drop their columns; achieved rate **measured** (not assumed) and persisted in `device.json`; unit-tested | 
 | P9 | Cheap capture-health signals | not started | |
 | P10 | Local visual continuity | not started | |
 | P11 | Coverage model | not started | |
@@ -374,7 +374,7 @@ the next meaningful trajectory for the pipeline).
 | BF-T01 | 10 s headless static capture (phone on a table, textured background) | border scan, counters, intrinsics, metadata |
 | BF-T02 | 10 s slow pan (hand-held) | + tracking coverage, pose cadence |
 | BF-T03 | 30 s room walk, 3–4 stops | + trajectory continuity, discontinuity report sane |
-| BF-T04 | interrupted capture (stop via force-stop mid-recording) | session marked incomplete, no corrupt MP4, files consistent |
+| BF-T04 | interrupted capture (stop via force-stop mid-recording) | session marked incomplete, no corrupt MP4, files consistent | **passed 2026-10-04** (force-stop at 12 s → only `video/camera.mp4.tmp` remains; no manifest; inspector's completeness gate fails by design) |
 | BF-T05 | full room (≈ washroom scale) | end-to-end; only after T01–T04 pass; feeds the BF pipeline |
 
 No long reconstruction run (COLMAP/VGGT/MASt3R/GS) is justified until T01–T02
@@ -680,8 +680,9 @@ it means reset / relocalization / bad pose / fast motion):
 
 ## P6 — Intrinsics: document what is actually provided
 
-**Status (2026-10-04): implemented in v0.4.0, locally verified (unit
-tests; on-device capture with this build still pending).** `IntrinsicsJson.kt`
+**Status (2026-10-04): implemented in v0.4.0, live verified (on-device
+captures 2026-10-04 validated the encoded-K chain in portrait and
+landscape).** `IntrinsicsJson.kt`
 writes `camera/intrinsics.json` with explicit `source` tagging
 (`arcore` for what the platform exposed, `derived:arcore` for the
 encoded-image K), `distortion: null` with an explanatory note (ARCore
@@ -701,8 +702,10 @@ optical geometry.
 
 ## P7 — Complete preservation-grade capture/v1
 
-**Status (2026-10-04): implemented in v0.4.0, locally verified (unit
-tests; on-device capture still pending).** `ManifestJson.kt` writes the
+**Status (2026-10-04): implemented in v0.4.0, live verified — including
+BF-T04: a force-stop 12 s into a recording left the session with no
+manifest and no final-named MP4 (only the in-flight `camera.mp4.tmp`),
+which is exactly the incomplete-session contract.** `ManifestJson.kt` writes the
 full payload set in the spec's order and `manifest.json` **last**,
 atomically (temp file + rename, so a truncated manifest can never
 exist). The manifest carries: schema + `completeness: complete` (its mere
@@ -749,8 +752,8 @@ from a finalized one.
 
 ## P8 — Raw IMU logging
 
-**Status (2026-10-04): implemented in v0.4.0, locally verified (unit
-tests; on-device capture still pending).** `ImuLogger.kt` registers
+**Status (2026-10-04): implemented in v0.4.0, live verified (on-device
+2026-10-04).** `ImuLogger.kt` registers
 `TYPE_ACCELEROMETER` + `TYPE_GYROSCOPE` at `SENSOR_DELAY_GAME` for the
 duration of a recording (registered at START, unregistered before the
 export snapshot) and preserves the raw `SensorEvent` samples with their
