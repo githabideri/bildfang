@@ -45,7 +45,7 @@ filter, discard, or silently alter the preserved raw capture.
 | P6 | Intrinsics: source-tagged, validated scaling | **live verified (v0.4.0, on-device 2026-10-04)** | `camera/intrinsics.json` with explicit `source` tags; distortion never fabricated; encoded K derived only when the frozen mapping is a 90°-multiple orthogonal transform (three states: EXACT/ABSENT/REFUSED); unit-tested; on-device captures validated (orthogonal mapping → rectilinear K consistent, portrait + landscape) | 
 | P7 | Full preservation package + manifest | **live verified (v0.4.0, on-device 2026-10-04; BF-T04 passed)** | full payload set in the spec's order; `manifest.json` written **last**, atomically (tmp + rename): SHA-256 per payload, sizes, app version + git commit (BuildConfig), warnings list, `completeness: complete`; an interrupted capture has no manifest and stays distinguishable — force-stop at 12 s left only `video/camera.mp4.tmp` (the recorder renames to final only on clean finalize, so an interrupted session never presents a final-named MP4); unit-tested incl. known hash vectors | 
 | P8 | Raw IMU logging | **live verified (v0.4.0, on-device 2026-10-04)** | raw accelerometer + gyroscope `SensorEvent` samples merged in `android_monotonic` order → `imu/imu.csv`; 100 ms carry-freshness window (stale = empty cell, gap is data); missing sensors drop their columns; achieved rate **measured** (not assumed) and persisted in `device.json`; unit-tested | 
-| P9 | Cheap capture-health signals | **implemented + locally verified (v0.5.0, 2026-11-03); live-verification on Pixel 9 Pro pending** | pure `CaptureHealth.advise()` decision function (10 unit tests) + 2 Hz GL-thread sampling (blit → 32×18 renderbuffer → readPixels → luminance/sharpness/clipped; pose-velocity EMA) → colored advisory line pre- and during-recording; per-recording summary → optional `session.json → capture_health` block; session browser shows manifest-derived completeness (✓/⚠ + duration + warnings). Advisory only — never touches the capture. |
+| P9 | Cheap capture-health signals | **live verified (v0.5.0, 2026-11-03, Pixel 9 Pro)** | pure `CaptureHealth.advise()` decision function (10 unit tests) + 2 Hz GL-thread sampling (blit → 32×18 renderbuffer → readPixels → luminance/sharpness/clipped; pose-velocity EMA) → colored advisory line pre- and during-recording; per-recording summary → optional `session.json → capture_health` block; session browser shows manifest-derived completeness (✓/⚠ + duration + warnings). Advisory only — never touches the capture. First calibration data recorded below; LOW_VISUAL_DETAIL threshold flagged for a well-lit-scene re-tune. |
 | P10 | Local visual continuity | not started | |
 | P11 | Coverage model | not started | |
 | P12 | Learned VPR research/benchmark | not started | |
@@ -780,10 +780,14 @@ actual sample rate; document what was observed, not an assumption.
 
 ## P9 — First capture-health signals (no neural networks)
 
-> **Status 2026-11-03 (v0.5.0): implemented, locally verified (61 unit
-> tests incl. the decision function), APK built; on-device verification
-> pending (Pixel 9 Pro adb transport down — needs the fresh wireless-
-> debugging port card).** Implementation: pure `CaptureHealth.advise()`
+> **Status 2026-11-03 (v0.5.0): implemented + locally verified (61 unit
+> tests incl. the decision function) + live verified on the Pixel 9 Pro**
+> (two headless captures — 10 s static, 15 s — both completed with 100 %
+> tracking, 0 discontinuities, `inspect_capture.py` OK; advisory line
+> observed live: FIND FEATURES on a featureless view, TOO DARK in a dim
+> night corner; session browser ✓/⚠ + duration + warnings and the
+> post-finalize "walk another short part" guidance screenshot-confirmed).
+> Implementation: pure `CaptureHealth.advise()`
 > (worst-condition-first: TRACKING_LOST → TOO_DARK → TOO_BRIGHT →
 > LOW_VISUAL_DETAIL → MOVE_SLOWER → STILL → GOOD/READY) + 2 Hz sampling
 > on the GL thread (blit → 32×18 renderbuffer → readPixels; pose-velocity
@@ -791,9 +795,30 @@ actual sample rate; document what was observed, not an assumption.
 > advisory line; `HealthAccumulator` → optional `capture_health` summary
 > in `session.json`; session browser shows ✓/⚠ + duration + warnings
 > from the manifest; post-finalize status gives duration, tracking %,
-> discontinuities and the "walk another short part" guidance. Thresholds
-> are initial values — live tuning happens during BF-T03/T05 runs and is
-> recorded here.
+> discontinuities and the "walk another short part" guidance.
+>
+> **First calibration data (2026-11-03, dim lamp-corner scene, night):**
+> mean luminance ≈ 19, mean grid-sharpness < 0.005 (reports as 0.00),
+> and yet ARCore tracked at 100 %. **Decision: keep the current
+> thresholds.** The advisory serves the *reconstruction* quality of the
+> recorded video (downstream consumer), not ARCore's own tracking — it is
+> deliberately more conservative than the tracker, and "add light" is the
+> right fix in that scene. **Flagged for re-tuning:** the
+> LOW_VISUAL_DETAIL threshold (4.0) is mis-scaled for the 32×18 grid —
+> measured < 0.005 on a textured wall — so that code will not fire as
+> written; re-tune against a well-lit scene before trusting it (harmless
+> meanwhile: it is an additional signal, never a filter). **Test-protocol
+> note:** the headless `bf_autotest` window starts the moment tracking
+> locks, so *walk* captures need a longer window + "walk when the timer
+> starts" (both walk rounds came out de-facto static — max speed
+> 0.04–0.06 m/s, no actual walking captured). **Black-preview note:** pointing the phone at a point light
+> source crushes auto-exposure to near-black for *any* camera app (stock
+> camera control showed the room fine; bildfang re-launch preview fine
+> too) — a black preview is an aim/lighting fact, not an app bug.
+> **Grid-averaging note (third capture):** a scene with a well-lit wall
+> in the upper half and a dark desk in the lower half still read TOO DARK
+> on the 32×18 mean — the full-frame average under-weights visible
+> regions; percentile-based luminance is the likely re-tune.
 
 Cheap, explainable signals:
 
