@@ -54,6 +54,7 @@ object PoseJson {
         // (anchor convention, see docs/coordinate-system.md §1).
         val firstPerSegment = HashMap<Int, PoseRecord>()
         for (r in records) firstPerSegment.putIfAbsent(r.segment, r)
+        val segments = firstPerSegment.keys.sorted()
 
         val sb = StringBuilder()
         sb.append("{\n")
@@ -61,6 +62,34 @@ object PoseJson {
         sb.append("  \"coordinate_system\": \"").append(COORDINATE_SYSTEM).append("\",\n")
         sb.append("  \"clock\": \"timestamp_ns is session-relative (arcore_frame domain, anchor in session.json); raw value in frame_timestamp_raw_ns\",\n")
         sb.append("  \"units\": { \"translation\": \"meters\", \"rotation\": \"quaternion x,y,z,w\" },\n")
+        // P5: the per-segment raw anchors make the normalization a complete,
+        // documented operation: translation = translation_raw − anchor.
+        // ARCore exposes no rotation between two world frames, so the full
+        // SE(3) inter-segment transform is NOT recorded here — it has to be
+        // solved offline (during reconstruction) and is not recoverable
+        // from this file.
+        sb.append("  \"segments\": [\n")
+        segments.forEachIndexed { idx, seg ->
+            val a = firstPerSegment.getValue(seg)
+            val tsField = if (a.frameTsRawNs != 0L)
+                "        \"frame_timestamp_raw_ns\": ${a.frameTsRawNs},\n"
+            else ""
+            sb.append("    {\n")
+            sb.append("      \"segment\": ").append(seg).append(",\n")
+            sb.append("      \"first_pose\": ").append(a.index).append(",\n")
+            sb.append("      \"anchor\": {\n")
+            sb.append(tsField)
+            sb.append("        \"translation_raw\": { \"x\": ").append(f(a.x)).append(", ")
+              .append("\"y\": ").append(f(a.y)).append(", ")
+              .append("\"z\": ").append(f(a.z)).append(" },\n")
+            sb.append("        \"rotation_quaternion\": { \"x\": ").append(f(a.qx)).append(", ")
+              .append("\"y\": ").append(f(a.qy)).append(", ")
+              .append("\"z\": ").append(f(a.qz)).append(", ")
+              .append("\"w\": ").append(f(a.qw)).append(" }\n")
+            sb.append("      }\n")
+            sb.append("    }").append(if (idx < segments.size - 1) "," else "").append("\n")
+        }
+        sb.append("  ],\n")
         sb.append("  \"poses\": [\n")
         records.forEachIndexed { i, r ->
             val anchor = firstPerSegment.getValue(r.segment)
@@ -77,6 +106,11 @@ object PoseJson {
             sb.append("      \"translation\": { \"x\": ").append(f(r.x - anchor.x)).append(", ")
               .append("\"y\": ").append(f(r.y - anchor.y)).append(", ")
               .append("\"z\": ").append(f(r.z - anchor.z)).append(" },\n")
+            // P5: the un-normalized ARCore world-frame value, always kept
+            // next to the derived one (invariant 4 of capture-format.md).
+            sb.append("      \"translation_raw\": { \"x\": ").append(f(r.x)).append(", ")
+              .append("\"y\": ").append(f(r.y)).append(", ")
+              .append("\"z\": ").append(f(r.z)).append(" },\n")
             sb.append("      \"rotation_quaternion\": { \"x\": ").append(f(r.qx)).append(", ")
               .append("\"y\": ").append(f(r.qy)).append(", ")
               .append("\"z\": ").append(f(r.qz)).append(", ")

@@ -25,6 +25,16 @@
         android:textColor="#FF00E5FF"
         android:text="@string/time_zero" />
 
+    <!-- P9: capture-health advisory line (colored by severity in code).
+         It advises only — it never affects the raw capture. -->
+    <TextView
+        android:id="@+id/healthView"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:textSize="18sp"
+        android:textColor="#FF55E06A"
+        android:text="—" />
+
     <TextView
         android:id="@+id/metricsView"
         android:layout_width="match_parent"

@@ -188,12 +188,24 @@ chosen for tooling ergonomics at this size).
   "coordinate_system": "arcore-world-v1",
   "clock": "session-relative_ns (anchor in session.json)",
   "units": { "translation": "meters", "rotation": "quaternion x,y,z,w" },
+  "segments": [
+    {
+      "segment": 0,
+      "first_pose": 0,
+      "anchor": {
+        "frame_timestamp_raw_ns": 4321000000000,
+        "translation_raw": { "x": 1.0, "y": 1.4, "z": -2.0 },
+        "rotation_quaternion": { "x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0 }
+      }
+    }
+  ],
   "poses": [
     {
       "i": 0,
       "timestamp_ns": 12345678901234,
       "android_camera_timestamp_ns": 9876543210,
       "translation": { "x": 0.0, "y": 0.0, "z": 0.0 },
+      "translation_raw": { "x": 1.0, "y": 1.4, "z": -2.0 },
       "rotation_quaternion": { "x": 0.01, "y": 0.22, "z": 0.03, "w": 0.97 },
       "tracking_state": "TRACKING"
     }
@@ -205,6 +217,23 @@ chosen for tooling ergonomics at this size).
   anchor** (see "The clocks"; not the raw ARCore epoch).
 - `translation` — camera optical center position in the **ARCore world
   frame**, meters. See [coordinate-system.md](coordinate-system.md).
+- `translation_raw` (build 0.5.0+) — the un-normalized ARCore world
+  value, always kept next to the derived one (the raw-preservation
+  invariant applies to poses as well). Invariant: `translation =
+  translation_raw − segments[segment].anchor.translation_raw`.
+- `segments` (build 0.5.0+) — one entry per world frame, in order
+  (`segment` 0 is always present): the raw anchor pose that defines that
+  segment's normalization — `frame_timestamp_raw_ns`, `translation_raw`,
+  `rotation_quaternion` — plus `first_pose` (the index of the anchor). It
+  makes the normalization a complete, documented operation: with it, a
+  consumer can re-derive any normalized pose, and can see exactly what
+  was subtracted. **Limitation, stated plainly: ARCore exposes no
+  rotation *between* two world frames.** The anchor quaternions are
+  each segment's own world orientation, not a transform from one
+  segment to the next; the full SE(3) inter-segment transform must be
+  solved offline (during reconstruction) and is not recoverable from
+  this file. That is why a multi-segment capture is still not a single
+  connected trajectory.
 - `rotation_quaternion` — rotation **from camera local frame to world
   frame**, Hamilton convention, stored x,y,z,w.
 - `tracking_state` — `TRACKING` | `PAUSED` | `STOPPED`. `PAUSED` means
@@ -453,11 +482,31 @@ camera_metadata.availability     per-key three-state table:
                                   AVAILABLE_AND_CAPTURED |
                                   SUPPORTED_BUT_UNAVAILABLE_ON_DEVICE |
                                   NOT_EXPOSED_BY_CURRENT_API
-app.version                      "0.4.0" — bumped by hand with each
+app.version                      "0.5.0" — bumped by hand with each
                                   on-device milestone (0.3.0 = geometry-
                                   frozen recorder; 0.4.0 = full v1 payload
                                   set: manifest-last finalization,
-                                  source-tagged intrinsics, raw IMU)
+                                  source-tagged intrinsics, raw IMU;
+                                  0.5.0 = P9 capture_health block, per-
+                                  segment raw pose anchors,
+                                  translation_raw, session-browser
+                                  completeness) — the *example* values in
+                                  this document stay as written at v1
+                                  freeze; the field is per-build, not
+                                  per-spec.
+capture_health                   (optional, build 0.5.0+) — P9 advisory
+                                  summary: `sample_rate_hz`, `samples`,
+                                  `codes` (advisory code → count), mean
+                                  luminance / sharpness / translational +
+                                  angular velocity, max translational
+                                  velocity, `paused_fraction`. Statistics
+                                  over the 2 Hz signal samples taken
+                                  during recording. **Advisory only:** it
+                                  never filters, discards, or alters the
+                                  raw capture (ROADMAP guiding principle);
+                                  absent when no sample was taken; a
+                                  degraded (unavailable) statistic is
+                                  `null`, never a sentinel value.
 app.commit                       short git commit baked in at build time
                                   (BuildConfig) — the exact build
 files                            0.4.0 additionally points at the new

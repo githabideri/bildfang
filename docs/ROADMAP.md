@@ -41,11 +41,11 @@ filter, discard, or silently alter the preserved raw capture.
 | P2b | ARCore native custom-track playback round-trip | **dead end on this fleet (2026-09-01)** | both Pixels: ARCore 1.54 native recorder fatal; see verdict below |
 | P3 | Clock-domain model | **DONE** | `capture-format.md` rewritten: named domains (arcore_frame / android_camera / android_monotonic / wall_clock / sensor / container_pts), guaranteed/measured/unknown, no epoch claims; `frame_timestamp_raw_ns` stored per pose |
 | P4 | De-contradict capture-format.md clocks | **DONE** | same rewrite; "one shared clock" invariant removed; IMU + invariants sections aligned with the domain model |
-| P5 | Raw poses + trajectory_discontinuity | **IN PROGRESS** | multi-signal discontinuity detection → `poses/discontinuities.json` (informational, not a verdict); `translation_raw` + explicit SE(3) segment transform deferred until after v1 live-verify (schema freeze, step 9) |
+| P5 | Raw poses + trajectory_discontinuity | **DONE (discontinuities live-verified v0.4.0; `translation_raw` + `segments` in v0.5.0)** | multi-signal discontinuity detection → `poses/discontinuities.json` (informational, not a verdict); v0.5.0 adds per-pose `translation_raw` and the `segments` anchor array — the normalization is now a complete, documented operation. The remaining SE(3) gap is structural, not a deferral: ARCore exposes no inter-world-frame rotation, so the inter-segment transform can only be solved offline (documented in capture-format.md). |
 | P6 | Intrinsics: source-tagged, validated scaling | **live verified (v0.4.0, on-device 2026-10-04)** | `camera/intrinsics.json` with explicit `source` tags; distortion never fabricated; encoded K derived only when the frozen mapping is a 90°-multiple orthogonal transform (three states: EXACT/ABSENT/REFUSED); unit-tested; on-device captures validated (orthogonal mapping → rectilinear K consistent, portrait + landscape) | 
 | P7 | Full preservation package + manifest | **live verified (v0.4.0, on-device 2026-10-04; BF-T04 passed)** | full payload set in the spec's order; `manifest.json` written **last**, atomically (tmp + rename): SHA-256 per payload, sizes, app version + git commit (BuildConfig), warnings list, `completeness: complete`; an interrupted capture has no manifest and stays distinguishable — force-stop at 12 s left only `video/camera.mp4.tmp` (the recorder renames to final only on clean finalize, so an interrupted session never presents a final-named MP4); unit-tested incl. known hash vectors | 
 | P8 | Raw IMU logging | **live verified (v0.4.0, on-device 2026-10-04)** | raw accelerometer + gyroscope `SensorEvent` samples merged in `android_monotonic` order → `imu/imu.csv`; 100 ms carry-freshness window (stale = empty cell, gap is data); missing sensors drop their columns; achieved rate **measured** (not assumed) and persisted in `device.json`; unit-tested | 
-| P9 | Cheap capture-health signals | not started | |
+| P9 | Cheap capture-health signals | **implemented + locally verified (v0.5.0, 2026-11-03); live-verification on Pixel 9 Pro pending** | pure `CaptureHealth.advise()` decision function (10 unit tests) + 2 Hz GL-thread sampling (blit → 32×18 renderbuffer → readPixels → luminance/sharpness/clipped; pose-velocity EMA) → colored advisory line pre- and during-recording; per-recording summary → optional `session.json → capture_health` block; session browser shows manifest-derived completeness (✓/⚠ + duration + warnings). Advisory only — never touches the capture. |
 | P10 | Local visual continuity | not started | |
 | P11 | Coverage model | not started | |
 | P12 | Learned VPR research/benchmark | not started | |
@@ -375,7 +375,7 @@ the next meaningful trajectory for the pipeline).
 | BF-T02 | 10 s slow pan (hand-held) | + tracking coverage, pose cadence |
 | BF-T03 | 30 s room walk, 3–4 stops | + trajectory continuity, discontinuity report sane |
 | BF-T04 | interrupted capture (stop via force-stop mid-recording) | session marked incomplete, no corrupt MP4, files consistent | **passed 2026-10-04** (force-stop at 12 s → only `video/camera.mp4.tmp` remains; no manifest; inspector's completeness gate fails by design) |
-| BF-T05 | full room (≈ washroom scale) | end-to-end; only after T01–T04 pass; feeds the BF pipeline |
+| BF-T05 | a few short walks through the room (re-opened 2026-11-03: multiple short parts, each its own session — the v0.5.0 UX makes this the natural capture pattern; a single full-room scan is no longer required) | end-to-end; only after T01–T04 pass; feeds the BF pipeline |
 
 No long reconstruction run (COLMAP/VGGT/MASt3R/GS) is justified until T01–T02
 pass; multiple GPU-hours are only spent after T05.
@@ -641,6 +641,14 @@ Remove/rewrite. Distinguish:
 
 ## P5 — Pose schema and world-frame discontinuities
 
+> **Status 2026-11-03 (v0.5.0):** `translation_raw` per pose and the
+> `segments` anchor array are implemented and unit-tested (non-breaking
+> additions, see capture-format.md). The discontinuity events
+> (`poses/discontinuities.json`) were live-verified in v0.4.0. The only
+> open item is structural: ARCore exposes no rotation between two world
+> frames, so the full SE(3) inter-segment transform must be solved
+> offline during reconstruction — it cannot be recorded.
+
 Current `PoseJson` subtracts each segment's first translation but keeps
 the original quaternion — not a complete SE(3) transform if the world
 frame's orientation changed. Do not manufacture a normalized frame this
@@ -771,6 +779,21 @@ native timestamps. No resampling in the preservation layer. Measure the
 actual sample rate; document what was observed, not an assumption.
 
 ## P9 — First capture-health signals (no neural networks)
+
+> **Status 2026-11-03 (v0.5.0): implemented, locally verified (61 unit
+> tests incl. the decision function), APK built; on-device verification
+> pending (Pixel 9 Pro adb transport down — needs the fresh wireless-
+> debugging port card).** Implementation: pure `CaptureHealth.advise()`
+> (worst-condition-first: TRACKING_LOST → TOO_DARK → TOO_BRIGHT →
+> LOW_VISUAL_DETAIL → MOVE_SLOWER → STILL → GOOD/READY) + 2 Hz sampling
+> on the GL thread (blit → 32×18 renderbuffer → readPixels; pose-velocity
+> EMA with relocalization-spike guard; tracking-pause timing) → colored
+> advisory line; `HealthAccumulator` → optional `capture_health` summary
+> in `session.json`; session browser shows ✓/⚠ + duration + warnings
+> from the manifest; post-finalize status gives duration, tracking %,
+> discontinuities and the "walk another short part" guidance. Thresholds
+> are initial values — live tuning happens during BF-T03/T05 runs and is
+> recorded here.
 
 Cheap, explainable signals:
 
@@ -907,7 +930,8 @@ Strictly, unless an earlier step exposes a blocker:
 8. P8 raw IMU — **done in v0.4.0 (2026-10-04)**
 9. freeze a trustworthy capture-format v1 baseline (live-verify v0.4.0 on
    a device first: BF-T04/T05, then re-run the BF-T03 dataset with it)
-10. P9 simple capture-health feedback
+10. P9 simple capture-health feedback — **implemented + locally verified
+    in v0.5.0 (2026-11-03); live-verification pending**
 11. P10 local visual continuity
 12. P11 coverage
 13. P12/P13 learned VPR + verified loop closure

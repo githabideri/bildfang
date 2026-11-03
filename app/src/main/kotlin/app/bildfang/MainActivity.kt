@@ -40,8 +40,11 @@ import android.opengl.EGLContext
 import android.opengl.EGLDisplay
 import android.opengl.EGLExt
 import android.opengl.EGLSurface
+import android.opengl.GLES30
+import org.json.JSONObject
 import javax.microedition.khronos.opengles.GL10
 import kotlin.concurrent.Volatile
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.sqrt
 import kotlin.math.roundToInt
@@ -143,6 +146,33 @@ class MainActivity : Activity() {
     // ---- P8: raw IMU logging (SensorEvent, android_monotonic domain) ----
     private var imu: ImuLogger? = null
 
+    // ---- P9: cheap capture-health signals (the advisory layer — it
+    //      advises, it never touches the raw capture; see the guiding
+    //      principle in docs/ROADMAP.md) ----
+    @Volatile private var healthAdvisory = Advisory("—", "…", CaptureHealth.SEV_OK)
+    private var lastPostedHealthCode = ""
+    private val healthAccum = HealthAccumulator()
+    private var healthGridFbo = 0
+    private var healthGridRbo = 0
+    private var healthGridReady = false
+    private var healthGridFailed = 0
+    private var lastHealthSampleMonoNs = 0L
+    private var lastTrackingState = ""
+    private var trackingLeftMonoNs = 0L
+    private var lastMoveMonoNs = 0L
+    private var motionSeeded = false
+    private var emaTransVelMs = 0f
+    private var emaAngVelDegS = 0f
+    private var lastMotionX = 0f
+    private var lastMotionY = 0f
+    private var lastMotionZ = 0f
+    private var lastMotionQx = 0f
+    private var lastMotionQy = 0f
+    private var lastMotionQz = 0f
+    private var lastMotionQw = 1f
+    private var lastMotionTsNs = 0L
+    private var lastMotionState = ""
+
     // ---- P1.1 steps 6-7: storage (SAF) + session browser ----
     private var storageRootUri: Uri? = null
     private var storageRootName = "app-external"
@@ -175,6 +205,7 @@ class MainActivity : Activity() {
     private lateinit var timerView: TextView
     private lateinit var metricsView: TextView
     private lateinit var statusView: TextView
+    private lateinit var healthView: TextView
     private lateinit var startBtn: Button
     private lateinit var stopBtn: Button
     private lateinit var sessionsBtn: Button
@@ -619,6 +650,78 @@ class MainActivity : Activity() {
     }
 
     /**
+     * GL thread. P9: reads a 32×18 downsample of the current preview
+     * framebuffer (blit → renderbuffer → readPixels) and derives mean
+     * luminance, mean luminance gradient (blur / low-detail proxy), and
+     * the clipped fraction. Everything here is advisory: any failure
+     * degrades to NaN (logged) and never touches the GL loop or the
+     * capture. ES3 is required for glBlitFramebuffer; the fleet-device
+     * context is ES3.x (see the shader comment in onSurfaceCreated).
+     */
+    private fun sampleHealthGrid(): HealthGridStats? {
+        if (healthGridFailed >= 3) return null // persistent failure: stop trying
+        return try {
+            val pw = previewSurfW
+            val ph = previewSurfH
+            if (pw <= 0 || ph <= 0) throw IllegalStateException("no surface yet")
+            if (!healthGridReady) {
+                val rbo = IntArray(1)
+                GLES30.glGenRenderbuffers(1, rbo, 0)
+                GLES30.glBindRenderbuffer(GLES30.GL_RENDERBUFFER, rbo[0])
+                GLES30.glRenderbufferStorage(GLES30.GL_RENDERBUFFER, GLES30.GL_RGBA8, HEALTH_GRID_W, HEALTH_GRID_H)
+                val fbo = IntArray(1)
+                GLES30.glGenFramebuffers(1, fbo, 0)
+                GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, fbo[0])
+                GLES30.glFramebufferRenderbuffer(GLES30.GL_FRAMEBUFFER, GLES30.GL_COLOR_ATTACHMENT0, GLES30.GL_RENDERBUFFER, rbo[0])
+                if (GLES30.glCheckFramebufferStatus(GLES30.GL_FRAMEBUFFER) != GLES30.GL_FRAMEBUFFER_COMPLETE) {
+                    throw IllegalStateException("health grid FBO incomplete")
+                }
+                GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+                healthGridRbo = rbo[0]
+                healthGridFbo = fbo[0]
+                healthGridReady = true
+            }
+            GLES30.glBindFramebuffer(GLES30.GL_READ_FRAMEBUFFER, 0)
+            GLES30.glBindFramebuffer(GLES30.GL_DRAW_FRAMEBUFFER, healthGridFbo)
+            GLES30.glBlitFramebuffer(
+                0, 0, pw, ph,
+                0, 0, HEALTH_GRID_W, HEALTH_GRID_H,
+                GLES30.GL_COLOR_BUFFER_BIT, GLES30.GL_NEAREST
+            )
+            val buf = ByteBuffer.allocateDirect(HEALTH_GRID_W * HEALTH_GRID_H * 4).order(ByteOrder.nativeOrder())
+            GLES30.glReadPixels(0, 0, HEALTH_GRID_W, HEALTH_GRID_H, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, buf)
+            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+            val n = HEALTH_GRID_W * HEALTH_GRID_H
+            val lum = FloatArray(n)
+            var sum = 0f
+            var clipped = 0
+            for (i in 0 until n) {
+                val r = buf.get(i * 4).toInt() and 0xFF
+                val gr = buf.get(i * 4 + 1).toInt() and 0xFF
+                val b = buf.get(i * 4 + 2).toInt() and 0xFF
+                val l = 0.299f * r + 0.587f * gr + 0.114f * b
+                lum[i] = l
+                sum += l
+                if (l >= CaptureHealth.CLIP_LEVEL) clipped++
+            }
+            var gsum = 0f
+            var gn = 0
+            for (y in 0 until HEALTH_GRID_H) {
+                for (x in 0 until HEALTH_GRID_W) {
+                    val i = y * HEALTH_GRID_W + x
+                    if (x + 1 < HEALTH_GRID_W) { gsum += abs(lum[i + 1] - lum[i]); gn++ }
+                    if (y + 1 < HEALTH_GRID_H) { gsum += abs(lum[i + HEALTH_GRID_W] - lum[i]); gn++ }
+                }
+            }
+            HealthGridStats(sum / n, if (gn > 0) gsum / gn else 0f, clipped.toFloat() / n)
+        } catch (e: Exception) {
+            healthGridFailed++
+            android.util.Log.w("bildfang", "health grid sample degraded to NaN: ${e.javaClass.simpleName} ${e.message}")
+            null
+        }
+    }
+
+    /**
      * Ask ARCore to remap the screen quad into texture space (sensor
      * orientation, display rotation, aspect ratio, center crop). Returns
      * true on success; the quad keeps its previous UVs on failure.
@@ -703,6 +806,7 @@ class MainActivity : Activity() {
         stopBtn = findViewById(R.id.stopBtn)
         sessionsBtn = findViewById(R.id.sessionsBtn)
         storageBtn = findViewById(R.id.storageBtn)
+        healthView = findViewById(R.id.healthView)
 
         glView.setEGLContextClientVersion(2)
         glView.setEGLConfigChooser(8, 8, 8, 8, 16, 0)
@@ -967,6 +1071,17 @@ class MainActivity : Activity() {
         encModelRefused = false
         rotationEventsDuringRec = 0
         lastSensorOrientation = 0
+        // P9: fresh advisory state for this session (the grid FBO
+        // persists; the accumulator does not).
+        healthAccum.reset()
+        motionSeeded = false
+        emaTransVelMs = 0f
+        emaAngVelDegS = 0f
+        lastMotionState = ""
+        lastMoveMonoNs = 0L
+        trackingLeftMonoNs = 0L
+        lastTrackingState = ""
+        lastPostedHealthCode = ""
         camMetaRecords.clear()
         camMetaProbeDone = false
         geomFrozen = false
@@ -1023,6 +1138,9 @@ class MainActivity : Activity() {
 
         val snapshot = synchronized(posesLock) { poses.toList() }
         val discSnapshot = synchronized(posesLock) { discontinuities.toList() }
+        // P9: advisory summary (optional block in session.json, non-
+        // breaking; absent when no sample was taken).
+        val healthSummary = if (healthAccum.samples > 0) healthAccum.toSummary() else null
         val dir = sessionDir
         if (snapshot.isEmpty() || dir == null) {
             statusView.text = if (snapshot.isEmpty())
@@ -1073,7 +1191,7 @@ class MainActivity : Activity() {
             // P7: device identity at model level + measured IMU rates.
             File(dir, "metadata/device.json").apply { parentFile?.mkdirs() }
                 .writeText(buildDeviceJson(imu, imuAccel, imuGyro))
-            File(dir, "session.json").writeText(buildSessionJson())
+            File(dir, "session.json").writeText(buildSessionJson(healthSummary))
             val videoFileOk = videoFile?.let { it.exists() && it.length() > 0 } == true
             if (!videoFileOk) warnings.add("video missing or empty (no muxed frames; poses-only session)")
             // P7: manifest written last, atomically (tmp + rename). A
@@ -1087,8 +1205,16 @@ class MainActivity : Activity() {
             if (storageRootUri != null) {
                 copySessionToSaf(dir)
             } else {
-                statusView.text = "Saved · ${snapshot.size} poses · " +
-                    if (manifestOk) "manifest OK (complete session)" else "MANIFEST FAILED (session incomplete)"
+                val durS = (SystemClock.elapsedRealtimeNanos() - sessionStartMonoNs) / 1_000_000_000L
+                val trackedPct = if (snapshot.isNotEmpty())
+                    String.format(Locale.US, "%.0f%%",
+                        100.0 * snapshot.count { it.trackingState == "TRACKING" } / snapshot.size)
+                else "?"
+                statusView.text = String.format(Locale.US,
+                    "Saved · %ds · %s tracking · %d discontinuit(y/ies) · %d poses",
+                    durS, trackedPct, discSnapshot.size, snapshot.size) +
+                    (if (manifestOk) " · manifest OK (complete session)" else " · MANIFEST FAILED (session incomplete)") +
+                    "\nWalk another short part if the room isn't fully covered — each walk becomes its own session; Bildwerk merges them."
             }
         } catch (e: Exception) {
             statusView.text = "Export failed: ${e.message}"
@@ -1233,7 +1359,7 @@ class MainActivity : Activity() {
         return ok
     }
 
-    private fun buildSessionJson(): String {
+    private fun buildSessionJson(health: HealthSummaryJson.Summary? = null): String {
         val arcore = try {
             packageManager.getPackageInfo("com.google.ar.core", 0).versionName ?: "unknown"
         } catch (e: Exception) { "unknown" }
@@ -1345,7 +1471,8 @@ class MainActivity : Activity() {
                 "anchor_unix_ms": $anchorUnixMs,
                 "anchor_monotonic_ns": $anchorMonoNs,
                 "note": "anchor_frame_ts is the raw ARCore frame clock (epoch unknown/opaque); poses are session-relative from it; see docs/capture-format.md clock domains"
-              }
+              }${if (health != null) "," else ""}
+${if (health != null) HealthSummaryJson.build(health) else ""}
             }
         """.trimIndent()
     }
@@ -1367,6 +1494,50 @@ class MainActivity : Activity() {
             com.google.ar.core.TrackingState.STOPPED -> "STOPPED"
         }
         trackingState = state
+
+        // ---- P9: cheap capture-health signals (advisory only) ----
+        // Motion EMA over consecutive TRACKING pose pairs. Runs before
+        // and during recording: pre-recording it feeds the
+        // "READY / FIND FEATURES" line, during recording the
+        // MOVE_SLOWER / STILL advice. Implausible deltas
+        // (relocalization jumps, >500 ms gaps) are skipped, never
+        // averaged in.
+        val monoNow = SystemClock.elapsedRealtimeNanos()
+        if (lastMotionTsNs != 0L && lastMotionState == "TRACKING" && state == "TRACKING") {
+            val dts = frame.timestamp - lastMotionTsNs
+            if (dts in 5_000_000L..500_000_000L) {
+                val dtS = dts / 1_000_000_000.0
+                val dv = sqrt(
+                    (t[0] - lastMotionX) * (t[0] - lastMotionX) +
+                    (t[1] - lastMotionY) * (t[1] - lastMotionY) +
+                    (t[2] - lastMotionZ) * (t[2] - lastMotionZ)
+                )
+                val v = (dv / dtS).toFloat()
+                val a = (quaternionAngleDeg(
+                    lastMotionQx, lastMotionQy, lastMotionQz, lastMotionQw,
+                    q[0], q[1], q[2], q[3]
+                ) / dtS).toFloat()
+                if (v <= 5.0 && a <= 360.0) {
+                    emaTransVelMs = if (motionSeeded) 0.75f * emaTransVelMs + 0.25f * v else v
+                    emaAngVelDegS = if (motionSeeded) 0.75f * emaAngVelDegS + 0.25f * a else a
+                    motionSeeded = true
+                }
+            }
+        }
+        lastMotionX = t[0]; lastMotionY = t[1]; lastMotionZ = t[2]
+        lastMotionQx = q[0]; lastMotionQy = q[1]; lastMotionQz = q[2]; lastMotionQw = q[3]
+        lastMotionTsNs = frame.timestamp
+        lastMotionState = state
+        if (state != "TRACKING" && trackingLeftMonoNs == 0L) trackingLeftMonoNs = monoNow
+        if (state == "TRACKING") {
+            trackingLeftMonoNs = 0L
+            if (lastTrackingState != "TRACKING" && lastMoveMonoNs == 0L) lastMoveMonoNs = monoNow
+        }
+        lastTrackingState = state
+        val pausedMs = if (trackingLeftMonoNs == 0L) 0L
+        else (monoNow - trackingLeftMonoNs) / 1_000_000L
+        if (emaTransVelMs > CaptureHealth.STILL_VEL_MS) lastMoveMonoNs = monoNow
+        val stillMs = if (lastMoveMonoNs == 0L) 0L else monoNow - lastMoveMonoNs
 
         if (frame.timestamp != lastDistinctTsNs) {
             lastDistinctTsNs = frame.timestamp
@@ -1458,6 +1629,40 @@ class MainActivity : Activity() {
                     state, frameCount, distinctFrameCount, fps, drawRate, segment,
                     if (recording) " · rec" else "", t[0], t[1], t[2]
                 )
+            }
+        }
+
+        // P9: 2 Hz advisory sample (GL thread — the grid read needs the
+        // current framebuffer). The advisory is displayed and (while
+        // recording) accumulated for the session summary; it never
+        // influences the encoder, the pose log, or the manifest.
+        if (monoNow - lastHealthSampleMonoNs >= 500_000_000L) {
+            lastHealthSampleMonoNs = monoNow
+            val g = sampleHealthGrid()
+            val sample = HealthSample(
+                tracking = state,
+                pausedMs = pausedMs,
+                transVelMs = emaTransVelMs,
+                angVelDegS = emaAngVelDegS,
+                luminance = g?.luminance ?: Float.NaN,
+                sharpness = g?.sharpness ?: Float.NaN,
+                clippedFrac = g?.clippedFrac ?: Float.NaN,
+            )
+            val adv = CaptureHealth.advise(sample, recording, stillMs)
+            healthAdvisory = adv
+            if (recording) healthAccum.add(sample, adv)
+            if (adv.code != lastPostedHealthCode) {
+                lastPostedHealthCode = adv.code
+                postToUi {
+                    healthView.text = adv.message
+                    healthView.setTextColor(
+                        when (adv.severity) {
+                            CaptureHealth.SEV_OK -> 0xFF55E06A.toInt()
+                            CaptureHealth.SEV_WARN -> 0xFFFFC838.toInt()
+                            else -> 0xFFFF5C57.toInt()
+                        }
+                    )
+                }
             }
         }
     }
@@ -1758,26 +1963,64 @@ class MainActivity : Activity() {
     private fun docSize(d: DocumentFile): Long =
         d.length() + d.listFiles().filter { it.isDirectory }.map { docSize(it) }.sum()
 
+    /**
+     * P9: session-browser detail derived from the small metadata files
+     * only (never the video): duration + warning count from the manifest
+     * (its presence is the completeness fact), or an explicit
+     * INCOMPLETE marker when there is none. `org.json` is part of the
+     * Android platform (no dependency).
+     */
+    private fun manifestDetailJson(text: String): String {
+        val j = JSONObject(text)
+        val durS = j.optLong("duration_ns", 0L) / 1_000_000_000L
+        val warns = j.optJSONArray("warnings")?.length() ?: 0
+        return String.format(Locale.US, "%.0fs · %d warning(s)", durS, warns)
+    }
+
+    private fun sessionDetail(dir: File): String {
+        val man = File(dir, "manifest.json")
+        if (man.exists()) {
+            return try { manifestDetailJson(man.readText()) } catch (e: Exception) { "complete" }
+        }
+        return if (File(dir, "session.json").exists())
+            "complete (pre-0.4.0 marker)"
+        else
+            "INCOMPLETE — interrupted, no manifest"
+    }
+
+    private fun sessionDetailDoc(root: DocumentFile): String {
+        val man = root.findFile("manifest.json") ?: return "INCOMPLETE — interrupted, no manifest"
+        return try {
+            val stream = contentResolver.openInputStream(man.uri) ?: return "manifest (unreadable)"
+            val text = stream.use { it.readBytes().toString(Charsets.UTF_8) }
+            manifestDetailJson(text)
+        } catch (e: Exception) { "complete" }
+    }
+
     private fun showSessionBrowser() {
-        data class Item(val label: String, val bytes: Long, val complete: Boolean, val node: Any)
+        data class Item(val label: String, val bytes: Long, val complete: Boolean, val detail: String, val node: Any)
         val items = ArrayList<Item>()
         val apBase = getExternalFilesDir(null) ?: filesDir
         val apSes = File(apBase, "sessions")
         if (apSes.isDirectory) {
             apSes.listFiles()?.filter { it.isDirectory }?.sortedBy { it.name }?.forEach {
-                items.add(Item("app: ${it.name}", dirSize(it), File(it, "manifest.json").exists() || File(it, "session.json").exists(), it))
+                val complete = File(it, "manifest.json").exists() || File(it, "session.json").exists()
+                items.add(Item(it.name, dirSize(it), complete, sessionDetail(it), it))
             }
         }
         safSessions().sortedBy { it.name }.forEach {
-            items.add(Item("saf: ${it.name}", docSize(it), it.findFile("manifest.json") != null || it.findFile("session.json") != null, it))
+            val complete = it.findFile("manifest.json") != null || it.findFile("session.json") != null
+            items.add(Item(it.name ?: "", docSize(it), complete, sessionDetailDoc(it), it))
         }
         if (items.isEmpty()) {
             statusView.text = "No sessions yet"
             return
         }
+        // ✓ = manifest present (complete session, file-existence fact);
+        // ⚠ = interrupted (no manifest — see capture-format.md).
         val labels = items.map {
-            val mb = it.bytes / 1048576.0
-            String.format(Locale.US, "%s · %.2f MB%s", it.label, mb, if (it.complete) "" else " · INCOMPLETE")
+            val mark = if (it.complete) "✓" else "⚠"
+            String.format(Locale.US, "%s %s · %.2f MB · %s", mark, it.label, it.bytes / 1048576.0, it.detail)
         }
         AlertDialog.Builder(this)
             .setTitle("Sessions")
@@ -1812,10 +2055,15 @@ class MainActivity : Activity() {
         // GL_TEXTURE_EXTERNAL_OES (not in GLES20)
         const val GL_TEXTURE_EXTERNAL_OES = 0x8D65
 
+        // P9 health grid (downsample of the preview framebuffer).
+        const val HEALTH_GRID_W = 32
+        const val HEALTH_GRID_H = 18
+
         // Bumped by hand with each on-device milestone (0.3.0 =
         // geometry-frozen recorder 2026-09-02; 0.4.0 = capture-format v1
         // freeze: manifest-last finalize + hashes, source-tagged
-        // intrinsics, raw IMU).
-        const val APP_VERSION = "0.4.0"
+        // intrinsics, raw IMU; 0.5.0 = P9 capture-health advisory UI +
+        // per-segment raw pose anchors + session-browser completeness).
+        const val APP_VERSION = "0.5.0"
     }
 }
