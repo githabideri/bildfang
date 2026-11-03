@@ -819,6 +819,15 @@ actual sample rate; document what was observed, not an assumption.
 > in the upper half and a dark desk in the lower half still read TOO DARK
 > on the 32×18 mean — the full-frame average under-weights visible
 > regions; percentile-based luminance is the likely re-tune.
+> **Suspect-blit note (four captures):** `mean_luminance` came out
+> identical (19.19) in all four sessions, including one whose on-screen
+> view was clearly different (lit wall upper half) — the 32×18 blit may
+> be reading a stale framebuffer rather than the current scene. The
+> advisory was never wrong in practice (every scene was in fact dark),
+> but the re-tune session must verify the blit path with per-sample
+> debug output before any luminance number is believed; per-sample
+> values should also be persisted (means-only makes freezes
+> undiagnosable after the fact).
 
 Cheap, explainable signals:
 
